@@ -2,9 +2,12 @@
 
 #include "settings.hpp"
 
+#include <appmodel.h>
+
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -32,6 +35,56 @@ std::wstring quote_argument(std::wstring value) {
     output.append(slashes * 2, L'\\');
     output.push_back(L'"');
     return output;
+}
+
+bool is_file(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::optional<std::wstring> find_on_path() {
+    std::array<wchar_t, 32768> path{};
+    const DWORD length = SearchPathW(nullptr, L"codex.exe", nullptr, static_cast<DWORD>(path.size()), path.data(), nullptr);
+    if (length == 0 || length >= path.size()) return std::nullopt;
+    return std::wstring(path.data(), length);
+}
+
+std::optional<std::wstring> find_packaged_codex() {
+    constexpr wchar_t package_family[] = L"OpenAI.Codex_2p2nqsd0c76g0";
+    UINT32 count = 0;
+    UINT32 buffer_length = 0;
+    LONG result = FindPackagesByPackageFamily(package_family, PACKAGE_FILTER_HEAD, &count, nullptr,
+                                               &buffer_length, nullptr, nullptr);
+    if (result != ERROR_INSUFFICIENT_BUFFER || count == 0 || buffer_length == 0) return std::nullopt;
+
+    std::vector<PWSTR> package_names(count);
+    std::vector<WCHAR> package_buffer(buffer_length);
+    std::vector<UINT32> package_properties(count);
+    result = FindPackagesByPackageFamily(package_family, PACKAGE_FILTER_HEAD, &count, package_names.data(),
+                                         &buffer_length, package_buffer.data(), package_properties.data());
+    if (result != ERROR_SUCCESS) return std::nullopt;
+
+    for (UINT32 index = 0; index < count; ++index) {
+        UINT32 path_length = 0;
+        result = GetStagedPackagePathByFullName(package_names[index], &path_length, nullptr);
+        if (result != ERROR_INSUFFICIENT_BUFFER || path_length == 0) continue;
+        std::vector<WCHAR> package_path(path_length);
+        result = GetStagedPackagePathByFullName(package_names[index], &path_length, package_path.data());
+        if (result != ERROR_SUCCESS) continue;
+
+        std::wstring executable(package_path.data());
+        if (!executable.empty() && executable.back() != L'\\') executable.push_back(L'\\');
+        executable += L"app\\resources\\codex.exe";
+        if (is_file(executable)) return executable;
+    }
+    return std::nullopt;
+}
+
+std::wstring resolve_codex_executable(const std::wstring& configured_executable) {
+    if (!configured_executable.empty() && is_file(configured_executable)) return configured_executable;
+    if (const auto path_executable = find_on_path()) return *path_executable;
+    if (const auto packaged_executable = find_packaged_codex()) return *packaged_executable;
+    return configured_executable.empty() ? L"codex.exe" : configured_executable;
 }
 
 json::Value initialize_params() {
@@ -88,13 +141,13 @@ bool CodexClient::start(const std::wstring& configured_executable, std::string& 
     startup.hStdOutput = child_stdout_write;
     startup.hStdError = null_error == INVALID_HANDLE_VALUE ? child_stdout_write : null_error;
 
-    const std::wstring executable = configured_executable.empty() ? L"codex.exe" : configured_executable;
+    const std::wstring executable = resolve_codex_executable(configured_executable);
     std::wstring command = quote_argument(executable) + L" app-server --stdio";
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');
 
     PROCESS_INFORMATION process_info{};
-    const wchar_t* application_name = configured_executable.empty() ? nullptr : configured_executable.c_str();
+    const wchar_t* application_name = is_file(executable) ? executable.c_str() : nullptr;
     const BOOL created = CreateProcessW(application_name, mutable_command.data(), nullptr, nullptr, TRUE,
                                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr,
                                         &startup, &process_info);
