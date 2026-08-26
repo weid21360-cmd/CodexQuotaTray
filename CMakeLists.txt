@@ -34,7 +34,6 @@ target_compile_options(CodexQuotaTray PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/pe
 target_link_libraries(CodexQuotaTray PRIVATE cqt_core d2d1 dwrite dwmapi comdlg32 gdi32 user32 shell32 shlwapi ole32 advapi32)
 set_target_properties(CodexQuotaTray PROPERTIES
   OUTPUT_NAME "CodexQuotaTray"
-  VS_GLOBAL_EnableDpiAwareness "PerMonitor"
 )
 
 include(CTest)
