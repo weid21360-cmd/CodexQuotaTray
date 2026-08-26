@@ -302,7 +302,7 @@ void TrayIcon::paint_capsule() {
     const int percentage = quota ? static_cast<int>(std::round(quota->remaining_percent)) : -1;
     const COLORREF accent = quota && snapshot_.health == AppHealth::Healthy
         ? quota_color(quota->remaining_percent, settings_) : status_color(snapshot_, settings_);
-    const int diameter = std::max(18, client.bottom - 10);
+    const int diameter = std::max(18, static_cast<int>(client.bottom - 10));
     const int circle_left = 5;
     const int circle_top = (client.bottom - diameter) / 2;
     HPEN pen = CreatePen(PS_SOLID, 3, accent);
