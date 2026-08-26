@@ -1,0 +1,34 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake --preset x64-release
+
+      - name: Build
+        run: cmake --build --preset x64-release --parallel
+
+      - name: Test
+        run: ctest --preset x64-release
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: CodexQuotaTray-Windows-x64
+          path: build/x64-release/Release/CodexQuotaTray.exe
+          if-no-files-found: error
+          retention-days: 14
