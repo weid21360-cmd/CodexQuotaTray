@@ -2,10 +2,9 @@
 
 #include "settings.hpp"
 
-#include <appmodel.h>
-
 #include <algorithm>
 #include <array>
+#include <cwchar>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -49,41 +48,40 @@ std::optional<std::wstring> find_on_path() {
     return std::wstring(path.data(), length);
 }
 
-std::optional<std::wstring> find_packaged_codex() {
-    constexpr wchar_t package_family[] = L"OpenAI.Codex_2p2nqsd0c76g0";
-    UINT32 count = 0;
-    UINT32 buffer_length = 0;
-    LONG result = FindPackagesByPackageFamily(package_family, PACKAGE_FILTER_HEAD, &count, nullptr,
-                                               &buffer_length, nullptr, nullptr);
-    if (result != ERROR_INSUFFICIENT_BUFFER || count == 0 || buffer_length == 0) return std::nullopt;
+std::optional<std::wstring> find_desktop_cache() {
+    std::array<wchar_t, 32768> local_app_data{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data.data(),
+                                                  static_cast<DWORD>(local_app_data.size()));
+    if (length == 0 || length >= local_app_data.size()) return std::nullopt;
 
-    std::vector<PWSTR> package_names(count);
-    std::vector<WCHAR> package_buffer(buffer_length);
-    std::vector<UINT32> package_properties(count);
-    result = FindPackagesByPackageFamily(package_family, PACKAGE_FILTER_HEAD, &count, package_names.data(),
-                                         &buffer_length, package_buffer.data(), package_properties.data());
-    if (result != ERROR_SUCCESS) return std::nullopt;
+    std::wstring base(local_app_data.data(), length);
+    base += L"\\OpenAI\\Codex\\bin";
+    WIN32_FIND_DATAW entry{};
+    HANDLE search = FindFirstFileW((base + L"\\*").c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE) return std::nullopt;
 
-    for (UINT32 index = 0; index < count; ++index) {
-        UINT32 path_length = 0;
-        result = GetStagedPackagePathByFullName(package_names[index], &path_length, nullptr);
-        if (result != ERROR_INSUFFICIENT_BUFFER || path_length == 0) continue;
-        std::vector<WCHAR> package_path(path_length);
-        result = GetStagedPackagePathByFullName(package_names[index], &path_length, package_path.data());
-        if (result != ERROR_SUCCESS) continue;
-
-        std::wstring executable(package_path.data());
-        if (!executable.empty() && executable.back() != L'\\') executable.push_back(L'\\');
-        executable += L"app\\resources\\codex.exe";
-        if (is_file(executable)) return executable;
-    }
-    return std::nullopt;
+    std::optional<std::wstring> newest;
+    FILETIME newest_time{};
+    do {
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0) continue;
+        std::wstring candidate = base + L"\\" + entry.cFileName + L"\\codex.exe";
+        WIN32_FILE_ATTRIBUTE_DATA attributes{};
+        if (!GetFileAttributesExW(candidate.c_str(), GetFileExInfoStandard, &attributes) ||
+            (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        if (!newest || CompareFileTime(&attributes.ftLastWriteTime, &newest_time) > 0) {
+            newest = std::move(candidate);
+            newest_time = attributes.ftLastWriteTime;
+        }
+    } while (FindNextFileW(search, &entry));
+    FindClose(search);
+    return newest;
 }
 
 std::wstring resolve_codex_executable(const std::wstring& configured_executable) {
     if (!configured_executable.empty() && is_file(configured_executable)) return configured_executable;
     if (const auto path_executable = find_on_path()) return *path_executable;
-    if (const auto packaged_executable = find_packaged_codex()) return *packaged_executable;
+    if (const auto desktop_executable = find_desktop_cache()) return *desktop_executable;
     return configured_executable.empty() ? L"codex.exe" : configured_executable;
 }
 
