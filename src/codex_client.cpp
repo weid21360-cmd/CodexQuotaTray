@@ -80,8 +80,8 @@ std::optional<std::wstring> find_desktop_cache() {
 
 std::wstring resolve_codex_executable(const std::wstring& configured_executable) {
     if (!configured_executable.empty() && is_file(configured_executable)) return configured_executable;
-    if (const auto path_executable = find_on_path()) return *path_executable;
     if (const auto desktop_executable = find_desktop_cache()) return *desktop_executable;
+    if (const auto path_executable = find_on_path()) return *path_executable;
     return configured_executable.empty() ? L"codex.exe" : configured_executable;
 }
 
