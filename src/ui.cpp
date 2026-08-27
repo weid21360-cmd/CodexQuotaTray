@@ -332,12 +332,16 @@ void MainWindow::paint() {
     const auto snapshot = controller_->snapshot_copy();
     font_scale_ = static_cast<float>(settings.font_scale);
     const bool is_dark = dark(settings);
-    const auto background = is_dark ? color(0.075f, 0.092f, 0.112f) : color(0.95f, 0.96f, 0.975f);
+    const auto [primary, secondary] = palette_colors(settings);
+    const auto background = is_dark ? color(0.055f, 0.066f, 0.082f) : color(0.965f, 0.963f, 0.955f);
     render_target_->BeginDraw();
     render_target_->SetTransform(D2D1::Matrix3x2F::Scale(static_cast<float>(settings.window_scale), static_cast<float>(settings.window_scale)));
     render_target_->Clear(background);
     rounded_rect({0, 0, kBaseWidth, kBaseHeight}, 18.0f, background,
-                 is_dark ? color(0.15f, 0.18f, 0.22f) : color(0.78f, 0.80f, 0.84f), 1.0f);
+                 is_dark ? color(0.14f, 0.16f, 0.20f) : color(0.82f, 0.81f, 0.78f), 1.0f);
+    // Editorial, off-axis color fields keep the panel from feeling like a rigid settings dialog.
+    circle(405.0f, 38.0f, 112.0f, mix(background, primary, is_dark ? 0.10f : 0.065f));
+    circle(18.0f, 612.0f, 88.0f, mix(background, secondary, is_dark ? 0.065f : 0.04f));
     hits_.clear();
     if (page_ == Page::Home) draw_home(snapshot, settings);
     else if (page_ == Page::Settings) draw_settings(settings);
@@ -353,14 +357,17 @@ void MainWindow::draw_home(const UsageSnapshot& snapshot, const Settings& settin
     const auto [primary, secondary] = palette_colors(settings);
     const auto strong = is_dark ? color(0.96f, 0.97f, 1.0f) : color(0.08f, 0.10f, 0.14f);
     const auto muted = is_dark ? color(0.61f, 0.68f, 0.76f) : color(0.35f, 0.40f, 0.48f);
-    const auto divider = is_dark ? color(0.20f, 0.24f, 0.29f) : color(0.80f, 0.83f, 0.87f);
-    const auto card = is_dark ? color(0.105f, 0.125f, 0.15f) : color(0.91f, 0.93f, 0.96f);
+    const auto divider = is_dark ? color(0.18f, 0.21f, 0.26f) : color(0.83f, 0.83f, 0.80f);
+    const auto card = is_dark ? color(0.085f, 0.102f, 0.128f) : color(0.985f, 0.982f, 0.970f);
+    const auto elevated = is_dark ? color(0.115f, 0.132f, 0.164f) : color(0.935f, 0.928f, 0.905f);
 
-    text(L"Codex " + tr(settings, L"用量", L"Usage"), {25, 17, 300, 48}, 20, strong, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    text(plan_label(snapshot.plan_type), {25, 49, 300, 71}, 12, muted);
-    text(L"↻", {376, 17, 414, 56}, 26, muted, DWRITE_TEXT_ALIGNMENT_CENTER);
-    add_hit({370, 12, 418, 62}, "refresh");
-    line(24, 85, 412, 85, divider);
+    text(L"CODEX / " + tr(settings, L"实时用量", L"LIVE USAGE"), {25, 18, 285, 39}, 10, primary,
+         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    text(plan_label(snapshot.plan_type), {25, 39, 300, 68}, 19, strong,
+         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    rounded_rect({375, 19, 414, 58}, 19.5f, elevated, divider, 1.0f);
+    text(L"↻", {375, 23, 414, 55}, 20, strong, DWRITE_TEXT_ALIGNMENT_CENTER);
+    add_hit({368, 12, 420, 65}, "refresh");
 
     std::wstring health;
     D2D1_COLOR_F health_color = color(0.24f, 0.84f, 0.61f);
@@ -372,78 +379,108 @@ void MainWindow::draw_home(const UsageSnapshot& snapshot, const Settings& settin
     case AppHealth::Unavailable: health = tr(settings, L"服务不可用", L"Unavailable"); health_color = color(0.94f, 0.38f, 0.42f); break;
     default: health = tr(settings, L"正在连接", L"Connecting"); health_color = muted; break;
     }
-    text(health, {292, 99, 408, 123}, 12, health_color, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    text(L"Codex · " + plan_label(snapshot.plan_type), {25, 97, 292, 124}, 14, strong, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    rounded_rect({284, 69, 413, 92}, 11.5f, mix(card, health_color, 0.08f));
+    circle(298, 80.5f, 3.5f, health_color);
+    text(health, {307, 72, 402, 89}, 9, health_color, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
 
-    float quota_y = 132.0f;
     const std::size_t quota_count = std::min<std::size_t>(snapshot.quota_windows.size(), 2);
     if (quota_count == 0) {
-        rounded_rect({24, quota_y, 412, 211}, 10, card);
+        rounded_rect({20, 101, 416, 266}, 24, card, divider, 1.0f);
+        circle(377, 119, 52, mix(card, primary, 0.15f));
+        text(tr(settings, L"额度状态", L"QUOTA STATUS"), {38, 121, 250, 143}, 10, primary,
+             DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         text(snapshot.status_detail.empty() ? tr(settings, L"暂无额度数据", L"Quota data unavailable") : SettingsStore::utf8_to_wide(snapshot.status_detail),
-             {40, 153, 396, 194}, 13, muted, DWRITE_TEXT_ALIGNMENT_CENTER);
-        quota_y = 218;
+             {38, 157, 366, 205}, 18, strong, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        text(tr(settings, L"点击右上角重新连接", L"Use refresh to reconnect"), {38, 220, 360, 244}, 11, muted);
     } else {
-        for (std::size_t index = 0; index < quota_count; ++index) {
-            const auto& quota = snapshot.quota_windows[index];
-            std::wstring label;
-            if (quota.kind == QuotaKind::ShortTerm) label = tr(settings, L"▣  短期剩余", L"▣  Short-term remaining");
-            else if (quota.kind == QuotaKind::Weekly) label = tr(settings, L"◷  周额度剩余", L"◷  Weekly remaining");
-            else if (quota.kind == QuotaKind::Monthly) label = tr(settings, L"◫  月额度剩余", L"◫  Monthly remaining");
-            else label = std::to_wstring(quota.duration_minutes) + tr(settings, L" 分钟窗口", L" minute window");
-            text(label, {26, quota_y, 315, quota_y + 24}, 13, strong);
-            text(percent_text(quota.remaining_percent), {330, quota_y, 410, quota_y + 24}, 15, strong, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_BOLD);
-            rounded_rect({25, quota_y + 32, 411, quota_y + 43}, 5.5f, divider);
-            const float width = 386.0f * static_cast<float>(quota.remaining_percent / 100.0);
-            rounded_rect({25, quota_y + 32, 25 + width, quota_y + 43}, 5.5f, index == 0 ? primary : secondary);
-            text(tr(settings, L"剩余 ", L"Resets in ") + remaining_time(quota.resets_at, is_english), {26, quota_y + 52, 246, quota_y + 73}, 11, muted);
-            text(tr(settings, L"重置于 ", L"Reset ") + local_time_text(quota.resets_at, quota.kind != QuotaKind::ShortTerm), {235, quota_y + 52, 410, quota_y + 73}, 11, muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            quota_y += 89.0f;
+        const auto& quota = snapshot.quota_windows.front();
+        std::wstring label;
+        if (quota.kind == QuotaKind::ShortTerm) label = tr(settings, L"短期窗口", L"SHORT WINDOW");
+        else if (quota.kind == QuotaKind::Weekly) label = tr(settings, L"周额度", L"WEEKLY LIMIT");
+        else if (quota.kind == QuotaKind::Monthly) label = tr(settings, L"月额度", L"MONTHLY LIMIT");
+        else label = std::to_wstring(quota.duration_minutes) + tr(settings, L" 分钟窗口", L" MIN WINDOW");
+
+        rounded_rect({20, 101, 416, 254}, 24, card, divider, 1.0f);
+        circle(382, 119, 58, mix(card, primary, 0.18f));
+        text(label, {38, 119, 225, 140}, 10, primary, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        text(percent_text(quota.remaining_percent), {35, 143, 238, 202}, 43, strong,
+             DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_BOLD);
+        text(tr(settings, L"剩余额度", L"remaining"), {39, 204, 160, 225}, 11, muted);
+        rounded_rect({38, 229, 187, 237}, 4, divider);
+        const float width = 149.0f * static_cast<float>(quota.remaining_percent / 100.0);
+        rounded_rect({38, 229, 38 + width, 237}, 4, primary);
+        text(remaining_time(quota.resets_at, is_english), {244, 152, 395, 177}, 15, strong,
+             DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        text(tr(settings, L"距离重置", L"until reset"), {244, 178, 395, 199}, 10, muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+        if (quota_count >= 2) {
+            const auto& second = snapshot.quota_windows[1];
+            std::wstring second_label;
+            if (second.kind == QuotaKind::Weekly) second_label = tr(settings, L"周额度", L"WEEKLY");
+            else if (second.kind == QuotaKind::Monthly) second_label = tr(settings, L"月额度", L"MONTHLY");
+            else if (second.kind == QuotaKind::ShortTerm) second_label = tr(settings, L"短期额度", L"SHORT TERM");
+            else second_label = tr(settings, L"其他窗口", L"OTHER WINDOW");
+            rounded_rect({205, 208, 416, 279}, 18, elevated, mix(elevated, secondary, 0.55f), 1.0f);
+            text(second_label, {221, 219, 315, 238}, 9, secondary, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            text(percent_text(second.remaining_percent), {322, 215, 400, 241}, 17, strong,
+                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_BOLD);
+            rounded_rect({221, 250, 400, 256}, 3, divider);
+            const float second_width = 179.0f * static_cast<float>(second.remaining_percent / 100.0);
+            rounded_rect({221, 250, 221 + second_width, 256}, 3, secondary);
+            text(local_time_text(second.resets_at, true), {221, 260, 400, 276}, 8, muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
     }
 
-    const float chart_top = quota_count >= 2 ? 315.0f : 246.0f;
-    line(24, chart_top - 17, 412, chart_top - 17, divider);
-    text(tr(settings, L"Token 活动", L"Token activity"), {25, chart_top, 220, chart_top + 30}, 17, strong, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    const float chart_top = 296.0f;
+    rounded_rect({20, chart_top, 416, 528}, 22, card, divider, 1.0f);
+    text(tr(settings, L"Token 脉冲", L"Token pulse"), {38, chart_top + 17, 220, chart_top + 45}, 16, strong,
+         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     const auto values = chart_values(snapshot, settings.chart_range);
     const std::int64_t range_total = std::accumulate(values.begin(), values.end(), std::int64_t{});
     const std::int64_t display_total = snapshot.lifetime_tokens > 0 ? snapshot.lifetime_tokens : range_total;
-    text(compact_tokens(display_total), {315, chart_top - 2, 410, chart_top + 31}, 19, strong, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_BOLD);
+    text(compact_tokens(display_total), {300, chart_top + 14, 398, chart_top + 46}, 20, strong,
+         DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_BOLD);
 
     const std::array<std::wstring, 3> ranges{L"24" + tr(settings, L"小时", L"h"), L"7" + tr(settings, L"天", L"d"), L"30" + tr(settings, L"天", L"d")};
     for (int i = 0; i < 3; ++i) {
-        const float x = 25.0f + i * 64.0f;
+        const float x = 38.0f + i * 56.0f;
         const bool selected = static_cast<int>(settings.chart_range) == i;
-        if (selected) rounded_rect({x, chart_top + 37, x + 57, chart_top + 66}, 7, mix(card, primary, 0.12f), primary, 1.0f);
-        text(ranges[static_cast<std::size_t>(i)], {x, chart_top + 40, x + 57, chart_top + 63}, 11, selected ? primary : muted, DWRITE_TEXT_ALIGNMENT_CENTER);
-        add_hit({x, chart_top + 34, x + 57, chart_top + 69}, "range", i);
+        rounded_rect({x, chart_top + 53, x + 49, chart_top + 79}, 13,
+                     selected ? mix(card, primary, 0.20f) : elevated, selected ? primary : elevated, selected ? 1.0f : 0.0f);
+        text(ranges[static_cast<std::size_t>(i)], {x, chart_top + 57, x + 49, chart_top + 76}, 9,
+             selected ? primary : muted, DWRITE_TEXT_ALIGNMENT_CENTER, selected ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL);
+        add_hit({x - 3, chart_top + 49, x + 52, chart_top + 83}, "range", i);
     }
     const bool account_scope = settings.chart_range != ChartRange::Hours24 && !snapshot.account_daily.empty();
-    text(account_scope ? tr(settings, L"账户数据", L"Account") : tr(settings, L"本机数据", L"Local"), {300, chart_top + 41, 410, chart_top + 63}, 10, muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    text(account_scope ? tr(settings, L"账户数据", L"Account") : tr(settings, L"本机数据", L"Local"),
+         {286, chart_top + 57, 398, chart_top + 76}, 9, muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-    const float graph_top = chart_top + 78.0f;
-    const float graph_bottom = std::min(485.0f, graph_top + 102.0f);
+    const float graph_top = chart_top + 96.0f;
+    const float graph_bottom = chart_top + 202.0f;
     const auto maximum = std::max<std::int64_t>(1, *std::max_element(values.begin(), values.end()));
-    const float gap = 3.0f;
-    const float available = 387.0f;
+    const float gap = 3.2f;
+    const float available = 360.0f;
     const float bar_width = std::max(3.0f, (available - gap * static_cast<float>(values.size() - 1)) / static_cast<float>(values.size()));
     for (std::size_t i = 0; i < values.size(); ++i) {
         const float ratio = static_cast<float>(values[i]) / static_cast<float>(maximum);
         const float height = values[i] == 0 ? 2.0f : std::max(4.0f, ratio * (graph_bottom - graph_top));
-        const float x = 25.0f + i * (bar_width + gap);
-        rounded_rect({x, graph_bottom - height, x + bar_width, graph_bottom}, std::min(4.0f, bar_width / 2), primary);
+        const float x = 38.0f + i * (bar_width + gap);
+        const auto bar_color = mix(primary, secondary, values.size() <= 1 ? 0.0f : static_cast<float>(i) / static_cast<float>(values.size() - 1) * 0.55f);
+        rounded_rect({x, graph_bottom - height, x + bar_width, graph_bottom}, std::min(4.0f, bar_width / 2), bar_color);
     }
-    line(24, graph_bottom + 11, 412, graph_bottom + 11, divider);
+    line(38, graph_bottom + 1, 398, graph_bottom + 1, divider);
 
-    const float settings_y = graph_bottom + 28;
-    text(L"⚙", {25, settings_y - 5, 55, settings_y + 30}, 25, muted, DWRITE_TEXT_ALIGNMENT_CENTER);
-    text(tr(settings, L"设置", L"Settings"), {65, settings_y - 4, 310, settings_y + 20}, 15, strong);
-    text(tr(settings, L"配色、语言、数字条与更多设置", L"Colors, language, taskbar and more"), {65, settings_y + 20, 356, settings_y + 43}, 11, muted);
-    text(L"›", {380, settings_y, 411, settings_y + 31}, 24, muted, DWRITE_TEXT_ALIGNMENT_CENTER);
-    add_hit({20, settings_y - 12, 416, settings_y + 52}, "settings");
-    line(24, settings_y + 59, 412, settings_y + 59, divider);
-    text(tr(settings, L"更新 ", L"Updated ") + local_time_text(snapshot.updated_at, false), {25, settings_y + 73, 240, settings_y + 96}, 11, muted);
-    text(tr(settings, L"退出", L"Exit"), {350, settings_y + 70, 412, settings_y + 98}, 13, strong, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    add_hit({340, settings_y + 65, 418, settings_y + 103}, "exit");
+    rounded_rect({20, 544, 416, 604}, 19, elevated, divider, 1.0f);
+    rounded_rect({32, 555, 70, 593}, 12, mix(elevated, primary, 0.16f));
+    text(L"⚙", {32, 558, 70, 590}, 19, primary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(tr(settings, L"塑造你的仪表盘", L"Shape your dashboard"), {84, 553, 330, 575}, 13, strong,
+         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    text(tr(settings, L"颜色、语言、胶囊和玻璃质感", L"Color, language, capsule and glass"), {84, 577, 350, 596}, 9, muted);
+    text(L"›", {375, 555, 404, 590}, 22, primary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    add_hit({16, 538, 420, 610}, "settings");
+    text(tr(settings, L"更新 ", L"Updated ") + local_time_text(snapshot.updated_at, false), {25, 617, 245, 638}, 9, muted);
+    text(tr(settings, L"退出", L"Exit"), {350, 614, 412, 640}, 11, muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    add_hit({338, 607, 420, 646}, "exit");
 }
 
 void MainWindow::draw_settings(const Settings& settings) {
@@ -463,12 +500,12 @@ void MainWindow::draw_settings(const Settings& settings) {
     line(24, 85, 412, 85, divider);
 
     auto toggle = [&](float y, bool on, std::wstring title, std::wstring subtitle, std::string action) {
+        rounded_rect({20, y - 6, 416, y + 49}, 16, card, divider, 1.0f);
         text(title, {25, y, 300, y + 22}, 14, strong, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         text(subtitle, {25, y + 24, 320, y + 44}, 10, muted);
         rounded_rect({364, y + 4, 412, y + 30}, 13, on ? primary : divider);
         circle(on ? 399.0f : 377.0f, y + 17, 9, color(0.96f, 0.97f, 1.0f));
         add_hit({350, y - 4, 418, y + 44}, std::move(action));
-        line(24, y + 55, 412, y + 55, divider);
     };
     toggle(102, settings.capsule_enabled, tr(settings, L"任务栏数字条", L"Taskbar capsule"),
            tr(settings, L"显示完整剩余百分比", L"Show the full remaining percentage"), "toggle_capsule");
@@ -547,6 +584,7 @@ void MainWindow::draw_more(const Settings& settings) {
     line(24, 85, 412, 85, divider);
 
     auto slider = [&](float y, std::wstring label, double current, double minimum, double maximum, std::string action, bool enabled = true) {
+        rounded_rect({20, y - 8, 416, y + 51}, 16, card, divider, 1.0f);
         text(label, {25, y, 180, y + 24}, 14, enabled ? strong : muted, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         const float start = 183.0f;
         const float end = 402.0f;
@@ -563,7 +601,6 @@ void MainWindow::draw_more(const Settings& settings) {
         }
         rounded_rect({knob - 24, y - 2, knob + 24, y + 24}, 7, enabled ? primary : muted);
         text(std::to_wstring(static_cast<int>(std::round(current * 100))) + L"%", {knob - 24, y + 2, knob + 24, y + 21}, 10, color(1, 1, 1), DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_FONT_WEIGHT_BOLD);
-        line(24, y + 57, 412, y + 57, divider);
     };
 
     slider(105, tr(settings, L"悬浮窗", L"Window"), settings.window_scale, 0.8, 1.4, "window_scale");
