@@ -24,6 +24,7 @@ constexpr UINT kMenuRefresh = 2002;
 constexpr UINT kMenuCapsule = 2003;
 constexpr UINT kMenuStartup = 2004;
 constexpr UINT kMenuExit = 2005;
+constexpr UINT_PTR kCapsuleRestoreTimer = 1;
 
 bool use_english(const Settings& settings) {
     if (settings.language == LanguageMode::English) return true;
@@ -53,6 +54,15 @@ COLORREF status_color(const UsageSnapshot& snapshot, const Settings& settings) {
     if (snapshot.health == AppHealth::LoginRequired || snapshot.health == AppHealth::Unavailable) return RGB(235, 78, 88);
     if (snapshot.health == AppHealth::Cached || snapshot.health == AppHealth::Stale) return RGB(232, 166, 66);
     return palette_color(settings);
+}
+
+COLORREF blend_color(COLORREF a, COLORREF b, int amount) {
+    amount = std::clamp(amount, 0, 255);
+    const auto channel = [amount](int first, int second) {
+        return (first * (255 - amount) + second * amount) / 255;
+    };
+    return RGB(channel(GetRValue(a), GetRValue(b)), channel(GetGValue(a), GetGValue(b)),
+               channel(GetBValue(a), GetBValue(b)));
 }
 
 std::wstring quota_label(const QuotaWindow& quota, bool english) {
@@ -97,7 +107,8 @@ bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error
         error = L"无法创建任务栏数字条。";
         return false;
     }
-    SetLayeredWindowAttributes(capsule_, 0, 245, LWA_ALPHA);
+    // Keep the silhouette opaque. The previous global alpha softened the edge against the taskbar.
+    SetLayeredWindowAttributes(capsule_, 0, 255, LWA_ALPHA);
 
     data_.cbSize = sizeof(data_);
     data_.hWnd = owner_;
@@ -184,12 +195,13 @@ void TrayIcon::reposition_capsule() {
     if (!taskbar || !GetWindowRect(taskbar, &taskbar_rect)) should_show = false;
     if (!notification || !GetWindowRect(notification, &notification_rect)) should_show = false;
     if (!should_show) {
+        capsule_desired_visible_ = false;
         show_capsule(false);
         return;
     }
 
     const float scale = static_cast<float>(settings_.taskbar_scale) * static_cast<float>(GetDpiForWindow(taskbar)) / 96.0f;
-    const int width = static_cast<int>(std::round(96 * scale));
+    const int width = static_cast<int>(std::round(112 * scale));
     const int height = static_cast<int>(std::round(38 * scale));
     const bool horizontal = (taskbar_rect.right - taskbar_rect.left) > (taskbar_rect.bottom - taskbar_rect.top);
     int x = 0;
@@ -204,10 +216,19 @@ void TrayIcon::reposition_capsule() {
         if (y < taskbar_rect.top || y + height > taskbar_rect.bottom) should_show = false;
     }
     if (!should_show) {
+        capsule_desired_visible_ = false;
         show_capsule(false);
         return;
     }
-    if (!SetWindowPos(capsule_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+    // Tie the top-level capsule to Explorer's taskbar. This keeps it out of Show Desktop/minimize
+    // transitions while still avoiding any injection or modification inside Explorer.
+    if (GetWindow(capsule_, GW_OWNER) != taskbar) {
+        SetWindowLongPtrW(capsule_, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(taskbar));
+    }
+    capsule_desired_visible_ = true;
+    if (!SetWindowPos(capsule_, HWND_TOPMOST, x, y, width, height,
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER)) {
+        capsule_desired_visible_ = false;
         show_capsule(false);
         return;
     }
@@ -242,6 +263,18 @@ LRESULT TrayIcon::handle_capsule_message(UINT message, WPARAM wparam, LPARAM lpa
         return 0;
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+    case WM_SHOWWINDOW:
+        // Explorer can temporarily cloak or hide adjacent top-level windows when its taskbar is
+        // activated. Re-check placement shortly afterwards, but only when the capsule is desired.
+        if (!wparam && capsule_desired_visible_) SetTimer(capsule_, kCapsuleRestoreTimer, 180, nullptr);
+        return DefWindowProcW(capsule_, message, wparam, lparam);
+    case WM_TIMER:
+        if (wparam == kCapsuleRestoreTimer) {
+            KillTimer(capsule_, kCapsuleRestoreTimer);
+            reposition_capsule();
+            return 0;
+        }
+        return DefWindowProcW(capsule_, message, wparam, lparam);
     default:
         return DefWindowProcW(capsule_, message, wparam, lparam);
     }
@@ -282,7 +315,13 @@ void TrayIcon::show_menu() {
 }
 
 void TrayIcon::show_capsule(bool visible) {
-    ShowWindow(capsule_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    if (visible) {
+        if (!IsWindowVisible(capsule_)) ShowWindow(capsule_, SW_SHOWNOACTIVATE);
+        SetWindowPos(capsule_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+    } else if (IsWindowVisible(capsule_)) {
+        ShowWindow(capsule_, SW_HIDE);
+    }
 }
 
 void TrayIcon::paint_capsule() {
@@ -293,8 +332,9 @@ void TrayIcon::paint_capsule() {
     HDC memory = CreateCompatibleDC(dc);
     HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
     HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
-    const COLORREF background = RGB(28, 34, 42);
-    HBRUSH background_brush = CreateSolidBrush(background);
+    const COLORREF outer = RGB(9, 13, 20);
+    const COLORREF background = RGB(24, 30, 40);
+    HBRUSH background_brush = CreateSolidBrush(outer);
     FillRect(memory, &client, background_brush);
     DeleteObject(background_brush);
 
@@ -302,16 +342,69 @@ void TrayIcon::paint_capsule() {
     const int percentage = quota ? static_cast<int>(std::round(quota->remaining_percent)) : -1;
     const COLORREF accent = quota && snapshot_.health == AppHealth::Healthy
         ? quota_color(quota->remaining_percent, settings_) : status_color(snapshot_, settings_);
-    const int diameter = std::max(18, static_cast<int>(client.bottom - 10));
-    const int circle_left = 5;
+    const COLORREF border = blend_color(RGB(88, 98, 118), accent, 72);
+
+    // A crisp outer stroke and inset surface make the silhouette readable on both light and dark taskbars.
+    HPEN shell_pen = CreatePen(PS_SOLID, std::max(1, client.bottom / 24), border);
+    HBRUSH shell_brush = CreateSolidBrush(background);
+    HGDIOBJ old_pen = SelectObject(memory, shell_pen);
+    HGDIOBJ old_brush = SelectObject(memory, shell_brush);
+    RoundRect(memory, 1, 1, client.right - 1, client.bottom - 1, client.bottom - 2, client.bottom - 2);
+    SelectObject(memory, old_pen);
+    SelectObject(memory, old_brush);
+    DeleteObject(shell_pen);
+    DeleteObject(shell_brush);
+
+    const int diameter = std::max(18, static_cast<int>(client.bottom - 12));
+    const int circle_left = 7;
     const int circle_top = (client.bottom - diameter) / 2;
-    HPEN pen = CreatePen(PS_SOLID, 3, accent);
-    HGDIOBJ old_pen = SelectObject(memory, pen);
-    HGDIOBJ old_brush = SelectObject(memory, GetStockObject(HOLLOW_BRUSH));
+    HPEN track_pen = CreatePen(PS_SOLID, 3, RGB(57, 64, 78));
+    old_pen = SelectObject(memory, track_pen);
+    old_brush = SelectObject(memory, GetStockObject(HOLLOW_BRUSH));
     Ellipse(memory, circle_left, circle_top, circle_left + diameter, circle_top + diameter);
     SelectObject(memory, old_pen);
     SelectObject(memory, old_brush);
+    DeleteObject(track_pen);
+
+    HPEN pen = CreatePen(PS_SOLID, 3, accent);
+    old_pen = SelectObject(memory, pen);
+    old_brush = SelectObject(memory, GetStockObject(HOLLOW_BRUSH));
+    if (percentage < 0 || percentage >= 99) {
+        Ellipse(memory, circle_left, circle_top, circle_left + diameter, circle_top + diameter);
+    } else if (percentage > 0) {
+        const double pi = 3.14159265358979323846;
+        const double end_angle = (-90.0 + 360.0 * percentage / 100.0) * pi / 180.0;
+        const int center_x = circle_left + diameter / 2;
+        const int center_y = circle_top + diameter / 2;
+        const int radius = diameter / 2;
+        SetArcDirection(memory, AD_CLOCKWISE);
+        Arc(memory, circle_left, circle_top, circle_left + diameter, circle_top + diameter,
+            center_x, center_y - radius,
+            center_x + static_cast<int>(std::round(std::cos(end_angle) * radius)),
+            center_y + static_cast<int>(std::round(std::sin(end_angle) * radius)));
+    }
+    SelectObject(memory, old_pen);
+    SelectObject(memory, old_brush);
     DeleteObject(pen);
+
+    // A small lit core gives the quota mark a deliberate badge-like center instead of an empty ring.
+    const int core = std::max(4, diameter / 5);
+    HBRUSH core_brush = CreateSolidBrush(blend_color(background, accent, 96));
+    old_brush = SelectObject(memory, core_brush);
+    old_pen = SelectObject(memory, GetStockObject(NULL_PEN));
+    Ellipse(memory, circle_left + (diameter - core) / 2, circle_top + (diameter - core) / 2,
+            circle_left + (diameter + core) / 2, circle_top + (diameter + core) / 2);
+    SelectObject(memory, old_pen);
+    SelectObject(memory, old_brush);
+    DeleteObject(core_brush);
+
+    const int separator_x = circle_left + diameter + 8;
+    HPEN separator_pen = CreatePen(PS_SOLID, 1, RGB(48, 56, 70));
+    old_pen = SelectObject(memory, separator_pen);
+    MoveToEx(memory, separator_x, 9, nullptr);
+    LineTo(memory, separator_x, client.bottom - 9);
+    SelectObject(memory, old_pen);
+    DeleteObject(separator_pen);
 
     SetBkMode(memory, TRANSPARENT);
     SetTextColor(memory, RGB(248, 249, 252));
@@ -319,7 +412,7 @@ void TrayIcon::paint_capsule() {
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                    FF_DONTCARE, L"Segoe UI");
     HGDIOBJ old_font = SelectObject(memory, value_font);
-    RECT value_rect{diameter + 9, 2, client.right - 4, client.bottom / 2 + 6};
+    RECT value_rect{separator_x + 5, 2, client.right - 7, client.bottom / 2 + 7};
     const std::wstring value = percentage >= 0 ? std::to_wstring(percentage) + L"%" : L"--";
     DrawTextW(memory, value.c_str(), -1, &value_rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     SelectObject(memory, old_font);
@@ -330,7 +423,7 @@ void TrayIcon::paint_capsule() {
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                    FF_DONTCARE, L"Segoe UI");
     old_font = SelectObject(memory, label_font);
-    RECT label_rect{diameter + 9, client.bottom / 2, client.right - 4, client.bottom - 1};
+    RECT label_rect{separator_x + 5, client.bottom / 2, client.right - 7, client.bottom - 2};
     DrawTextW(memory, L"CODEX", -1, &label_rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     SelectObject(memory, old_font);
     DeleteObject(label_font);

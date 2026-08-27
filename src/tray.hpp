@@ -42,6 +42,7 @@ private:
     HICON dynamic_icon_ = nullptr;
     UsageSnapshot snapshot_;
     Settings settings_;
+    bool capsule_desired_visible_ = false;
 };
 
 } // namespace cqt
