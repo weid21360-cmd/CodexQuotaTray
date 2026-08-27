@@ -5,6 +5,7 @@
 #include "usage_parser.hpp"
 
 #include <Windows.h>
+#include <objidl.h>
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <shobjidl_core.h>
