@@ -31,7 +31,7 @@ add_executable(CodexQuotaTray WIN32
 target_include_directories(CodexQuotaTray PRIVATE src)
 target_compile_definitions(CodexQuotaTray PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 CQT_VERSION=L\"${PROJECT_VERSION}\")
 target_compile_options(CodexQuotaTray PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/permissive-;/utf-8;/EHsc>")
-target_link_libraries(CodexQuotaTray PRIVATE cqt_core d2d1 dwrite dwmapi comdlg32 gdi32 user32 shell32 shlwapi ole32 advapi32)
+target_link_libraries(CodexQuotaTray PRIVATE cqt_core d2d1 dwrite dwmapi comdlg32 gdi32 gdiplus user32 shell32 shlwapi ole32 advapi32)
 if(MSVC)
   target_link_options(CodexQuotaTray PRIVATE /MANIFEST:NO)
 endif()

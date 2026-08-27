@@ -5,6 +5,7 @@
 #include "usage_parser.hpp"
 
 #include <Windows.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <shobjidl_core.h>
 
@@ -25,6 +26,9 @@ constexpr UINT kMenuCapsule = 2003;
 constexpr UINT kMenuStartup = 2004;
 constexpr UINT kMenuExit = 2005;
 constexpr UINT_PTR kCapsuleRestoreTimer = 1;
+constexpr UINT kCapsuleEnsureZOrder = WM_APP + 43;
+
+TrayIcon* g_tray_instance = nullptr;
 
 bool use_english(const Settings& settings) {
     if (settings.language == LanguageMode::English) return true;
@@ -65,6 +69,23 @@ COLORREF blend_color(COLORREF a, COLORREF b, int amount) {
                channel(GetBValue(a), GetBValue(b)));
 }
 
+Gdiplus::Color gdiplus_color(COLORREF value, BYTE alpha = 255) {
+    return Gdiplus::Color(alpha, GetRValue(value), GetGValue(value), GetBValue(value));
+}
+
+void add_rounded_rectangle(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rectangle, float radius) {
+    const float diameter = std::min(radius * 2.0f, std::min(rectangle.Width, rectangle.Height));
+    if (diameter <= 0.0f) {
+        path.AddRectangle(rectangle);
+        return;
+    }
+    path.AddArc(rectangle.X, rectangle.Y, diameter, diameter, 180.0f, 90.0f);
+    path.AddArc(rectangle.GetRight() - diameter, rectangle.Y, diameter, diameter, 270.0f, 90.0f);
+    path.AddArc(rectangle.GetRight() - diameter, rectangle.GetBottom() - diameter, diameter, diameter, 0.0f, 90.0f);
+    path.AddArc(rectangle.X, rectangle.GetBottom() - diameter, diameter, diameter, 90.0f, 90.0f);
+    path.CloseFigure();
+}
+
 std::wstring quota_label(const QuotaWindow& quota, bool english) {
     switch (quota.kind) {
     case QuotaKind::ShortTerm: return english ? L"Short" : L"短期";
@@ -93,6 +114,11 @@ TrayIcon::~TrayIcon() {
 bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error) {
     controller_ = controller;
     owner_ = owner;
+    Gdiplus::GdiplusStartupInput gdiplus_input;
+    if (Gdiplus::GdiplusStartup(&gdiplus_token_, &gdiplus_input, nullptr) != Gdiplus::Ok) {
+        error = L"无法初始化任务栏图形引擎。";
+        return false;
+    }
     WNDCLASSEXW window_class{};
     window_class.cbSize = sizeof(window_class);
     window_class.hInstance = controller_->instance();
@@ -105,10 +131,14 @@ bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error
                                0, 0, 96, 38, nullptr, nullptr, controller_->instance(), this);
     if (!capsule_) {
         error = L"无法创建任务栏数字条。";
+        Gdiplus::GdiplusShutdown(gdiplus_token_);
+        gdiplus_token_ = 0;
         return false;
     }
-    // Keep the silhouette opaque. The previous global alpha softened the edge against the taskbar.
-    SetLayeredWindowAttributes(capsule_, 0, 255, LWA_ALPHA);
+    g_tray_instance = this;
+    foreground_hook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                                       foreground_event_proc, 0, 0,
+                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     data_.cbSize = sizeof(data_);
     data_.hWnd = owner_;
@@ -121,6 +151,11 @@ bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error
     wcscpy_s(data_.szTip, L"CodexQuotaTray · Connecting");
     if (!Shell_NotifyIconW(NIM_ADD, &data_)) {
         error = L"无法添加系统托盘图标。";
+        if (foreground_hook_) {
+            UnhookWinEvent(foreground_hook_);
+            foreground_hook_ = nullptr;
+        }
+        if (g_tray_instance == this) g_tray_instance = nullptr;
         return false;
     }
     Shell_NotifyIconW(NIM_SETVERSION, &data_);
@@ -128,6 +163,11 @@ bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error
 }
 
 void TrayIcon::destroy() {
+    if (foreground_hook_) {
+        UnhookWinEvent(foreground_hook_);
+        foreground_hook_ = nullptr;
+    }
+    if (g_tray_instance == this) g_tray_instance = nullptr;
     if (data_.hWnd) {
         Shell_NotifyIconW(NIM_DELETE, &data_);
         data_.hWnd = nullptr;
@@ -139,6 +179,10 @@ void TrayIcon::destroy() {
     if (capsule_) {
         DestroyWindow(capsule_);
         capsule_ = nullptr;
+    }
+    if (gdiplus_token_) {
+        Gdiplus::GdiplusShutdown(gdiplus_token_);
+        gdiplus_token_ = 0;
     }
 }
 
@@ -160,7 +204,7 @@ void TrayIcon::update(const UsageSnapshot& snapshot, const Settings& settings) {
         if (old) DestroyIcon(old);
     }
     reposition_capsule();
-    if (capsule_) InvalidateRect(capsule_, nullptr, FALSE);
+    if (capsule_ && capsule_desired_visible_) paint_capsule();
 }
 
 void TrayIcon::on_notify(LPARAM event) {
@@ -232,9 +276,10 @@ void TrayIcon::reposition_capsule() {
         show_capsule(false);
         return;
     }
-    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height / 2, height / 2);
-    SetWindowRgn(capsule_, region, TRUE);
+    // Per-pixel alpha supplies the smooth silhouette; a hard HRGN produces visible stair-stepping.
+    SetWindowRgn(capsule_, nullptr, FALSE);
     show_capsule(true);
+    paint_capsule();
 }
 
 LRESULT CALLBACK TrayIcon::capsule_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -246,6 +291,12 @@ LRESULT CALLBACK TrayIcon::capsule_proc(HWND window, UINT message, WPARAM wparam
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
     return self ? self->handle_capsule_message(message, wparam, lparam) : DefWindowProcW(window, message, wparam, lparam);
+}
+
+void CALLBACK TrayIcon::foreground_event_proc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (g_tray_instance && g_tray_instance->capsule_) {
+        PostMessageW(g_tray_instance->capsule_, kCapsuleEnsureZOrder, 0, 0);
+    }
 }
 
 LRESULT TrayIcon::handle_capsule_message(UINT message, WPARAM wparam, LPARAM lparam) {
@@ -275,6 +326,13 @@ LRESULT TrayIcon::handle_capsule_message(UINT message, WPARAM wparam, LPARAM lpa
             return 0;
         }
         return DefWindowProcW(capsule_, message, wparam, lparam);
+    case kCapsuleEnsureZOrder:
+        if (capsule_desired_visible_) {
+            SetWindowPos(capsule_, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+            paint_capsule();
+        }
+        return 0;
     default:
         return DefWindowProcW(capsule_, message, wparam, lparam);
     }
@@ -325,114 +383,124 @@ void TrayIcon::show_capsule(bool visible) {
 }
 
 void TrayIcon::paint_capsule() {
-    PAINTSTRUCT paint{};
-    HDC dc = BeginPaint(capsule_, &paint);
+    if (!capsule_ || !gdiplus_token_) return;
+    if (GetUpdateRect(capsule_, nullptr, FALSE)) {
+        PAINTSTRUCT paint{};
+        BeginPaint(capsule_, &paint);
+        EndPaint(capsule_, &paint);
+    }
+
     RECT client{};
     GetClientRect(capsule_, &client);
-    HDC memory = CreateCompatibleDC(dc);
-    HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) return;
+
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!memory || !bitmap || !pixels) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
     HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
-    const COLORREF outer = RGB(9, 13, 20);
-    const COLORREF background = RGB(24, 30, 40);
-    HBRUSH background_brush = CreateSolidBrush(outer);
-    FillRect(memory, &client, background_brush);
-    DeleteObject(background_brush);
 
     const QuotaWindow* quota = select_taskbar_quota(snapshot_, settings_.taskbar_metric);
     const int percentage = quota ? static_cast<int>(std::round(quota->remaining_percent)) : -1;
     const COLORREF accent = quota && snapshot_.health == AppHealth::Healthy
         ? quota_color(quota->remaining_percent, settings_) : status_color(snapshot_, settings_);
-    const COLORREF border = blend_color(RGB(88, 98, 118), accent, 72);
+    const COLORREF background = RGB(24, 30, 40);
+    const COLORREF border = blend_color(RGB(96, 106, 126), accent, 86);
 
-    // A crisp outer stroke and inset surface make the silhouette readable on both light and dark taskbars.
-    HPEN shell_pen = CreatePen(PS_SOLID, std::max(1, static_cast<int>(client.bottom / 24)), border);
-    HBRUSH shell_brush = CreateSolidBrush(background);
-    HGDIOBJ old_pen = SelectObject(memory, shell_pen);
-    HGDIOBJ old_brush = SelectObject(memory, shell_brush);
-    RoundRect(memory, 1, 1, client.right - 1, client.bottom - 1, client.bottom - 2, client.bottom - 2);
-    SelectObject(memory, old_pen);
-    SelectObject(memory, old_brush);
-    DeleteObject(shell_pen);
-    DeleteObject(shell_brush);
+    {
+        Gdiplus::Bitmap surface(width, height, width * 4, PixelFormat32bppPARGB,
+                                static_cast<BYTE*>(pixels));
+        Gdiplus::Graphics graphics(&surface);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
-    const int diameter = std::max(18, static_cast<int>(client.bottom - 12));
-    const int circle_left = 7;
-    const int circle_top = (client.bottom - diameter) / 2;
-    HPEN track_pen = CreatePen(PS_SOLID, 3, RGB(57, 64, 78));
-    old_pen = SelectObject(memory, track_pen);
-    old_brush = SelectObject(memory, GetStockObject(HOLLOW_BRUSH));
-    Ellipse(memory, circle_left, circle_top, circle_left + diameter, circle_top + diameter);
-    SelectObject(memory, old_pen);
-    SelectObject(memory, old_brush);
-    DeleteObject(track_pen);
+        Gdiplus::GraphicsPath body;
+        const Gdiplus::RectF body_rect(1.5f, 1.5f, static_cast<float>(width) - 3.0f,
+                                      static_cast<float>(height) - 3.0f);
+        add_rounded_rectangle(body, body_rect, body_rect.Height / 2.0f);
+        Gdiplus::SolidBrush body_brush(gdiplus_color(background, 252));
+        Gdiplus::Pen body_pen(gdiplus_color(border), 1.25f);
+        graphics.FillPath(&body_brush, &body);
+        graphics.DrawPath(&body_pen, &body);
 
-    HPEN pen = CreatePen(PS_SOLID, 3, accent);
-    old_pen = SelectObject(memory, pen);
-    old_brush = SelectObject(memory, GetStockObject(HOLLOW_BRUSH));
-    if (percentage < 0 || percentage >= 99) {
-        Ellipse(memory, circle_left, circle_top, circle_left + diameter, circle_top + diameter);
-    } else if (percentage > 0) {
-        const double pi = 3.14159265358979323846;
-        const double end_angle = (-90.0 + 360.0 * percentage / 100.0) * pi / 180.0;
-        const int center_x = circle_left + diameter / 2;
-        const int center_y = circle_top + diameter / 2;
-        const int radius = diameter / 2;
-        SetArcDirection(memory, AD_CLOCKWISE);
-        Arc(memory, circle_left, circle_top, circle_left + diameter, circle_top + diameter,
-            center_x, center_y - radius,
-            center_x + static_cast<int>(std::round(std::cos(end_angle) * radius)),
-            center_y + static_cast<int>(std::round(std::sin(end_angle) * radius)));
+        // Soft inner highlight separates the capsule from dark taskbars without a black halo.
+        Gdiplus::GraphicsPath highlight;
+        const Gdiplus::RectF highlight_rect(2.8f, 2.8f, static_cast<float>(width) - 5.6f,
+                                           static_cast<float>(height) - 5.6f);
+        add_rounded_rectangle(highlight, highlight_rect, highlight_rect.Height / 2.0f);
+        Gdiplus::Pen highlight_pen(Gdiplus::Color(42, 255, 255, 255), 0.75f);
+        graphics.DrawPath(&highlight_pen, &highlight);
+
+        const float diameter = std::max(18.0f, static_cast<float>(height) - 12.0f);
+        const Gdiplus::RectF progress_rect(7.0f, (height - diameter) / 2.0f, diameter, diameter);
+        Gdiplus::Pen track_pen(Gdiplus::Color(255, 56, 64, 78), 3.0f);
+        graphics.DrawEllipse(&track_pen, progress_rect);
+        Gdiplus::Pen progress_pen(gdiplus_color(accent), 3.0f);
+        progress_pen.SetStartCap(Gdiplus::LineCapRound);
+        progress_pen.SetEndCap(Gdiplus::LineCapRound);
+        if (percentage < 0) graphics.DrawEllipse(&progress_pen, progress_rect);
+        else if (percentage > 0) graphics.DrawArc(&progress_pen, progress_rect, -90.0f,
+                                                   std::min(359.9f, static_cast<float>(percentage) * 3.6f));
+
+        const float core = std::max(4.0f, diameter / 5.0f);
+        Gdiplus::SolidBrush core_brush(gdiplus_color(blend_color(background, accent, 112), 245));
+        graphics.FillEllipse(&core_brush, progress_rect.X + (diameter - core) / 2.0f,
+                             progress_rect.Y + (diameter - core) / 2.0f, core, core);
+
+        const float separator_x = progress_rect.GetRight() + 8.0f;
+        Gdiplus::Pen separator_pen(Gdiplus::Color(190, 54, 63, 78), 1.0f);
+        graphics.DrawLine(&separator_pen, separator_x, 9.0f, separator_x, static_cast<float>(height) - 9.0f);
+
+        const std::wstring value = percentage >= 0 ? std::to_wstring(percentage) + L"%" : L"--";
+        Gdiplus::Font value_font(L"Segoe UI", std::max(10.0f, height * 0.34f),
+                                 Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::Font label_font(L"Segoe UI", std::max(6.2f, height * 0.17f),
+                                 Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush value_brush(Gdiplus::Color(255, 248, 249, 252));
+        Gdiplus::SolidBrush label_brush(gdiplus_color(accent));
+        Gdiplus::StringFormat value_format;
+        value_format.SetAlignment(Gdiplus::StringAlignmentCenter);
+        value_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        value_format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        Gdiplus::RectF value_layout(separator_x + 5.0f, 1.0f,
+                                    width - separator_x - 12.0f, height * 0.62f);
+        graphics.DrawString(value.c_str(), -1, &value_font, value_layout, &value_format, &value_brush);
+        Gdiplus::RectF label_layout(separator_x + 5.0f, height * 0.53f,
+                                    width - separator_x - 12.0f, height * 0.34f);
+        graphics.DrawString(L"CODEX", -1, &label_font, label_layout, &value_format, &label_brush);
     }
-    SelectObject(memory, old_pen);
-    SelectObject(memory, old_brush);
-    DeleteObject(pen);
 
-    // A small lit core gives the quota mark a deliberate badge-like center instead of an empty ring.
-    const int core = std::max(4, diameter / 5);
-    HBRUSH core_brush = CreateSolidBrush(blend_color(background, accent, 96));
-    old_brush = SelectObject(memory, core_brush);
-    old_pen = SelectObject(memory, GetStockObject(NULL_PEN));
-    Ellipse(memory, circle_left + (diameter - core) / 2, circle_top + (diameter - core) / 2,
-            circle_left + (diameter + core) / 2, circle_top + (diameter + core) / 2);
-    SelectObject(memory, old_pen);
-    SelectObject(memory, old_brush);
-    DeleteObject(core_brush);
+    RECT window_rect{};
+    GetWindowRect(capsule_, &window_rect);
+    POINT destination{window_rect.left, window_rect.top};
+    POINT source{0, 0};
+    SIZE size{width, height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(capsule_, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
 
-    const int separator_x = circle_left + diameter + 8;
-    HPEN separator_pen = CreatePen(PS_SOLID, 1, RGB(48, 56, 70));
-    old_pen = SelectObject(memory, separator_pen);
-    MoveToEx(memory, separator_x, 9, nullptr);
-    LineTo(memory, separator_x, client.bottom - 9);
-    SelectObject(memory, old_pen);
-    DeleteObject(separator_pen);
-
-    SetBkMode(memory, TRANSPARENT);
-    SetTextColor(memory, RGB(248, 249, 252));
-    HFONT value_font = CreateFontW(-static_cast<int>(13 * settings_.taskbar_scale), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                   FF_DONTCARE, L"Segoe UI");
-    HGDIOBJ old_font = SelectObject(memory, value_font);
-    RECT value_rect{separator_x + 5, 2, client.right - 7, client.bottom / 2 + 7};
-    const std::wstring value = percentage >= 0 ? std::to_wstring(percentage) + L"%" : L"--";
-    DrawTextW(memory, value.c_str(), -1, &value_rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    SelectObject(memory, old_font);
-    DeleteObject(value_font);
-
-    SetTextColor(memory, accent);
-    HFONT label_font = CreateFontW(-static_cast<int>(8 * settings_.taskbar_scale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                   FF_DONTCARE, L"Segoe UI");
-    old_font = SelectObject(memory, label_font);
-    RECT label_rect{separator_x + 5, client.bottom / 2, client.right - 7, client.bottom - 2};
-    DrawTextW(memory, L"CODEX", -1, &label_rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    SelectObject(memory, old_font);
-    DeleteObject(label_font);
-
-    BitBlt(dc, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
     SelectObject(memory, old_bitmap);
     DeleteObject(bitmap);
     DeleteDC(memory);
-    EndPaint(capsule_, &paint);
+    ReleaseDC(nullptr, screen);
 }
 
 HICON TrayIcon::create_percentage_icon(int percentage, COLORREF accent) const {

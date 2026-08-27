@@ -27,6 +27,9 @@ public:
 
 private:
     static LRESULT CALLBACK capsule_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+    static void CALLBACK foreground_event_proc(HWINEVENTHOOK hook, DWORD event, HWND window,
+                                                LONG object_id, LONG child_id,
+                                                DWORD event_thread, DWORD event_time);
     LRESULT handle_capsule_message(UINT message, WPARAM wparam, LPARAM lparam);
     void add_icon();
     void show_menu();
@@ -40,6 +43,8 @@ private:
     HWND capsule_ = nullptr;
     NOTIFYICONDATAW data_{};
     HICON dynamic_icon_ = nullptr;
+    HWINEVENTHOOK foreground_hook_ = nullptr;
+    ULONG_PTR gdiplus_token_ = 0;
     UsageSnapshot snapshot_;
     Settings settings_;
     bool capsule_desired_visible_ = false;

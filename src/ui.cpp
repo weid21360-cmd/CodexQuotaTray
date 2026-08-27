@@ -386,7 +386,7 @@ void MainWindow::draw_home(const UsageSnapshot& snapshot, const Settings& settin
     const std::size_t quota_count = std::min<std::size_t>(snapshot.quota_windows.size(), 2);
     if (quota_count == 0) {
         rounded_rect({20, 101, 416, 266}, 24, card, divider, 1.0f);
-        circle(377, 119, 52, mix(card, primary, 0.15f));
+        circle(378, 142, 38, mix(card, primary, 0.14f));
         text(tr(settings, L"额度状态", L"QUOTA STATUS"), {38, 121, 250, 143}, 10, primary,
              DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         text(snapshot.status_detail.empty() ? tr(settings, L"暂无额度数据", L"Quota data unavailable") : SettingsStore::utf8_to_wide(snapshot.status_detail),
@@ -401,7 +401,8 @@ void MainWindow::draw_home(const UsageSnapshot& snapshot, const Settings& settin
         else label = std::to_wstring(quota.duration_minutes) + tr(settings, L" 分钟窗口", L" MIN WINDOW");
 
         rounded_rect({20, 101, 416, 254}, 24, card, divider, 1.0f);
-        circle(382, 119, 58, mix(card, primary, 0.18f));
+        // Keep the decorative field fully inside the hero card so it cannot cover the health chip.
+        circle(379, 141, 40, mix(card, primary, 0.16f));
         text(label, {38, 119, 225, 140}, 10, primary, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         text(percent_text(quota.remaining_percent), {35, 143, 238, 202}, 43, strong,
              DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_BOLD);
