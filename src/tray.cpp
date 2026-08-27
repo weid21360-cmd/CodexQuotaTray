@@ -345,7 +345,7 @@ void TrayIcon::paint_capsule() {
     const COLORREF border = blend_color(RGB(88, 98, 118), accent, 72);
 
     // A crisp outer stroke and inset surface make the silhouette readable on both light and dark taskbars.
-    HPEN shell_pen = CreatePen(PS_SOLID, std::max(1, client.bottom / 24), border);
+    HPEN shell_pen = CreatePen(PS_SOLID, std::max(1, static_cast<int>(client.bottom / 24)), border);
     HBRUSH shell_brush = CreateSolidBrush(background);
     HGDIOBJ old_pen = SelectObject(memory, shell_pen);
     HGDIOBJ old_brush = SelectObject(memory, shell_brush);
