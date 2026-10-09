@@ -284,7 +284,10 @@ void AppController::worker_loop() {
             if (!codex_.start(settings.codex_executable, error)) {
                 working.health = working.updated_at > 0 ? AppHealth::Stale : AppHealth::Unavailable;
                 working.status_detail = std::move(error);
-                publish_snapshot(working, false);
+                // Establish file offsets even while app-server is unavailable so the next
+                // token_count write can still be handled as a true live increment.
+                const bool initialized_history = !history_initialized && refresh_local_history();
+                publish_snapshot(working, initialized_history);
                 std::unique_lock wait_lock(worker_mutex_);
                 worker_condition_.wait_for(wait_lock, retry_delay, [&] {
                     return stopping_.load() || restart_client_ || refresh_requested_ || history_requested_;
