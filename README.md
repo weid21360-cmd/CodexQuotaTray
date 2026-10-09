@@ -8,6 +8,7 @@ A lightweight native Windows tray monitor for Codex quota and token activity. Th
 - Shows returned short-term, weekly, monthly, or unknown-duration quota windows without assuming that `primary` always means five hours.
 - Displays remaining percentage, reset countdown, reset time, account plan, and service health.
 - Provides 24-hour local Token activity plus 7-day and 30-day account activity with local fallback.
+- Reacts to new local `token_count` events in real time: the chart, session counter, and taskbar capsule pulse with the newly added Token count.
 - Includes a standard notification-area icon and an optional non-invasive taskbar capsule.
 - Supports Chinese, English, system/dark/light appearance, four palettes, custom colors, sizing controls, startup toggle, cached offline display, and manual Codex executable selection.
 - Does not read or persist authentication tokens. See [PRIVACY.md](PRIVACY.md).
@@ -45,7 +46,7 @@ The installer output is written to `dist/`. It does not require administrator ri
 - `MainWindow`: Win32 + Direct2D/DirectWrite three-page UI with per-monitor DPI behavior.
 - `TrayIcon`: `Shell_NotifyIcon`, dynamic percentage icon, context menu, and optional taskbar-adjacent capsule.
 
-The UI process performs no hidden-window animation. Quota refreshes once per minute, Token data refreshes every five minutes, and connection failures back off to five minutes.
+The UI process performs no hidden-window animation. Quota refreshes once per minute; account Token totals refresh every five minutes. Local Token activity uses Windows directory-change notifications instead of disk polling, and its short animation runs only when a new `token_count` event arrives. Connection failures back off to five minutes.
 
 ## Tests
 

@@ -10,10 +10,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace cqt {
 
@@ -52,6 +54,7 @@ public:
 
 private:
     void worker_loop();
+    void history_watch_loop();
     void publish_snapshot(const UsageSnapshot& snapshot, bool persist);
     void save_and_apply(Settings settings, bool restart_client = false);
     void choose_codex_executable();
@@ -70,11 +73,16 @@ private:
     CodexClient codex_;
     UsageHistory history_;
     std::thread worker_;
+    std::thread history_watcher_;
+    HANDLE history_stop_event_ = nullptr;
     std::atomic_bool stopping_{false};
     std::condition_variable worker_condition_;
     std::mutex worker_mutex_;
     bool refresh_requested_ = false;
     bool usage_requested_ = false;
+    bool history_requested_ = false;
+    bool history_full_refresh_requested_ = false;
+    std::vector<std::filesystem::path> history_changed_paths_;
     bool restart_client_ = false;
     std::chrono::steady_clock::time_point last_manual_refresh_{};
 };

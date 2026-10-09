@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <shellapi.h>
 
+#include <chrono>
 #include <string>
 
 namespace cqt {
@@ -48,6 +49,7 @@ private:
     UsageSnapshot snapshot_;
     Settings settings_;
     bool capsule_desired_visible_ = false;
+    std::chrono::steady_clock::time_point live_pulse_until_{};
 };
 
 } // namespace cqt

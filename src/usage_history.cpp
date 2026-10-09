@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <ctime>
+#include <cwctype>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -121,26 +122,63 @@ UsageHistory::UsageHistory(std::filesystem::path codex_home) : codex_home_(std::
     }
 }
 
-void UsageHistory::refresh(UsageSnapshot& snapshot) {
-    if (stop_requested_.load()) return;
+std::int64_t UsageHistory::refresh(UsageSnapshot& snapshot) {
+    if (stop_requested_.load()) return 0;
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     discover_files();
+    std::int64_t discovered_tokens = 0;
     for (auto& [key, state] : files_) {
         if (stop_requested_.load()) break;
         (void)key;
-        scan_file(state);
+        discovered_tokens += scan_file(state);
     }
     prune();
-
-    snapshot.local_hourly.clear();
-    for (const auto& [epoch, tokens] : hourly_tokens_) {
-        snapshot.local_hourly.push_back({epoch, {}, tokens, UsageScope::Local});
-    }
-    snapshot.local_daily.clear();
-    for (const auto& [date, tokens] : daily_tokens_) {
-        snapshot.local_daily.push_back({0, date, tokens, UsageScope::Local});
-    }
+    apply_to(snapshot);
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    return discovered_tokens;
+}
+
+std::int64_t UsageHistory::refresh_changed(
+    UsageSnapshot& snapshot, const std::vector<std::filesystem::path>& relative_paths) {
+    if (stop_requested_.load()) return 0;
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    std::int64_t discovered_tokens = 0;
+    for (const auto& relative : relative_paths) {
+        if (stop_requested_.load() || relative.empty() || relative.is_absolute() ||
+            relative.extension() != L".jsonl") continue;
+        bool safe = true;
+        for (const auto& component : relative) {
+            if (component == L"..") {
+                safe = false;
+                break;
+            }
+        }
+        if (!safe) continue;
+
+        auto part = relative.begin();
+        if (part == relative.end()) continue;
+        std::wstring root = part->wstring();
+        std::transform(root.begin(), root.end(), root.begin(), [](wchar_t character) {
+            return static_cast<wchar_t>(std::towlower(character));
+        });
+        if (root != L"sessions" && root != L"archived_sessions") continue;
+
+        const auto path = codex_home_ / relative;
+        const std::wstring key = path.filename().wstring();
+        auto [position, inserted] = files_.try_emplace(key);
+        if (inserted) position->second.path = path;
+        else if (position->second.path != path) {
+            std::error_code old_path_error;
+            if (position->second.offset == 0 || !std::filesystem::exists(position->second.path, old_path_error)) {
+                position->second.path = path;
+            }
+        }
+        discovered_tokens += scan_file(position->second);
+    }
+    prune();
+    apply_to(snapshot);
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    return discovered_tokens;
 }
 
 void UsageHistory::discover_files() {
@@ -180,20 +218,21 @@ void UsageHistory::discover_files() {
     }
 }
 
-void UsageHistory::scan_file(FileState& state) {
+std::int64_t UsageHistory::scan_file(FileState& state) {
     std::error_code error;
     const auto size = std::filesystem::file_size(state.path, error);
-    if (error) return;
+    if (error) return 0;
     if (size < state.offset) {
         state.offset = 0;
         state.last_total = 0;
     }
-    if (size == state.offset) return;
+    if (size == state.offset) return 0;
 
     std::ifstream stream(state.path, std::ios::binary);
-    if (!stream) return;
+    if (!stream) return 0;
     if (state.offset > 0) stream.seekg(static_cast<std::streamoff>(state.offset));
 
+    std::int64_t discovered_tokens = 0;
     auto consume_line = [&](std::string& line) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find("\"type\":\"event_msg\"") == std::string::npos ||
@@ -210,6 +249,7 @@ void UsageHistory::scan_file(FileState& state) {
         if (timestamp <= 0) return;
         const std::int64_t hour = timestamp - (timestamp % kSecondsPerHour);
         hourly_tokens_[hour] += delta;
+        discovered_tokens += delta;
         const std::string date = local_date(timestamp);
         if (!date.empty()) daily_tokens_[date] += delta;
     };
@@ -243,6 +283,7 @@ void UsageHistory::scan_file(FileState& state) {
         }
     }
     state.offset = committed_offset;
+    return discovered_tokens;
 }
 
 void UsageHistory::prune() {
@@ -252,6 +293,17 @@ void UsageHistory::prune() {
 
     const std::string date_cutoff = local_date(now - 31 * kSecondsPerDay);
     while (!daily_tokens_.empty() && daily_tokens_.begin()->first < date_cutoff) daily_tokens_.erase(daily_tokens_.begin());
+}
+
+void UsageHistory::apply_to(UsageSnapshot& snapshot) const {
+    snapshot.local_hourly.clear();
+    for (const auto& [epoch, tokens] : hourly_tokens_) {
+        snapshot.local_hourly.push_back({epoch, {}, tokens, UsageScope::Local});
+    }
+    snapshot.local_daily.clear();
+    for (const auto& [date, tokens] : daily_tokens_) {
+        snapshot.local_daily.push_back({0, date, tokens, UsageScope::Local});
+    }
 }
 
 } // namespace cqt

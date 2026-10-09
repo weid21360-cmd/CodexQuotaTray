@@ -120,7 +120,7 @@ void test_incremental_history() {
 
     cqt::UsageHistory history(root);
     cqt::UsageSnapshot snapshot;
-    history.refresh(snapshot);
+    CHECK(history.refresh(snapshot) == 100);
     auto total = std::accumulate(snapshot.local_hourly.begin(), snapshot.local_hourly.end(), std::int64_t{},
                                  [](std::int64_t sum, const cqt::TokenBucket& bucket) { return sum + bucket.tokens; });
     CHECK(total == 100);
@@ -128,7 +128,7 @@ void test_incremental_history() {
         std::ofstream stream(log, std::ios::binary | std::ios::app);
         stream << second.substr(split) << '\n';
     }
-    history.refresh(snapshot);
+    CHECK(history.refresh_changed(snapshot, {std::filesystem::path("sessions") / "session.jsonl"}) == 60);
     total = std::accumulate(snapshot.local_hourly.begin(), snapshot.local_hourly.end(), std::int64_t{},
                             [](std::int64_t sum, const cqt::TokenBucket& bucket) { return sum + bucket.tokens; });
     CHECK(total == 160);

@@ -26,6 +26,9 @@ namespace {
 
 constexpr float kBaseWidth = 436.0f;
 constexpr float kBaseHeight = 650.0f;
+constexpr UINT_PTR kClockTimer = 1;
+constexpr UINT_PTR kLivePulseTimer = 2;
+constexpr std::int64_t kLivePulseSeconds = 4;
 
 D2D1_COLOR_F from_argb(std::uint32_t color, float alpha_multiplier = 1.0f) {
     return D2D1::ColorF(((color >> 16) & 0xff) / 255.0f, ((color >> 8) & 0xff) / 255.0f,
@@ -158,12 +161,17 @@ void MainWindow::show() {
     position_near_taskbar();
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
-    SetTimer(hwnd_, 1, 1000, nullptr);
+    SetTimer(hwnd_, kClockTimer, 1000, nullptr);
+    const auto snapshot = controller_->snapshot_copy();
+    if (snapshot.live_token_updated_at > 0 && unix_now() - snapshot.live_token_updated_at < kLivePulseSeconds) {
+        SetTimer(hwnd_, kLivePulseTimer, 80, nullptr);
+    }
     invalidate();
 }
 
 void MainWindow::hide() {
-    KillTimer(hwnd_, 1);
+    KillTimer(hwnd_, kClockTimer);
+    KillTimer(hwnd_, kLivePulseTimer);
     ShowWindow(hwnd_, SW_HIDE);
     discard_device_resources();
 }
@@ -174,6 +182,14 @@ bool MainWindow::visible() const {
 
 void MainWindow::invalidate() {
     if (hwnd_ && visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::on_snapshot_updated(const UsageSnapshot& snapshot) {
+    if (!hwnd_ || !visible()) return;
+    if (snapshot.live_token_updated_at > 0 && unix_now() - snapshot.live_token_updated_at < kLivePulseSeconds) {
+        SetTimer(hwnd_, kLivePulseTimer, 80, nullptr);
+    }
+    invalidate();
 }
 
 void MainWindow::apply_settings() {
@@ -262,6 +278,13 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
         if (wparam == VK_ESCAPE) hide();
         return 0;
     case WM_TIMER:
+        if (wparam == kLivePulseTimer) {
+            const auto snapshot = controller_->snapshot_copy();
+            if (snapshot.live_token_updated_at <= 0 ||
+                unix_now() - snapshot.live_token_updated_at >= kLivePulseSeconds) {
+                KillTimer(hwnd_, kLivePulseTimer);
+            }
+        }
         if (visible()) invalidate();
         return 0;
     case WM_DPICHANGED: {
@@ -434,13 +457,35 @@ void MainWindow::draw_home(const UsageSnapshot& snapshot, const Settings& settin
 
     const float chart_top = 296.0f;
     rounded_rect({20, chart_top, 416, 528}, 22, card, divider, 1.0f);
-    text(tr(settings, L"Token 脉冲", L"Token pulse"), {38, chart_top + 17, 220, chart_top + 45}, 16, strong,
+    const std::int64_t live_age = snapshot.live_token_updated_at > 0
+        ? unix_now() - snapshot.live_token_updated_at : kLivePulseSeconds;
+    const bool live_pulse = snapshot.live_token_delta > 0 && live_age >= 0 && live_age < kLivePulseSeconds;
+    const float pulse = live_pulse
+        ? 0.55f + 0.45f * static_cast<float>(std::sin(static_cast<double>(GetTickCount64()) / 135.0))
+        : 0.0f;
+    if (live_pulse) {
+        rounded_rect({20.8f, chart_top + 0.8f, 415.2f, 527.2f}, 21.2f, color(0, 0, 0, 0),
+                     color(primary.r, primary.g, primary.b, 0.42f + pulse * 0.35f), 1.2f + pulse * 0.8f);
+    }
+    text(tr(settings, L"Token 脉冲", L"Token pulse"), {38, chart_top + 17, 176, chart_top + 45}, 16, strong,
          DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     const auto values = chart_values(snapshot, settings.chart_range);
     const std::int64_t range_total = std::accumulate(values.begin(), values.end(), std::int64_t{});
     const std::int64_t display_total = snapshot.lifetime_tokens > 0 ? snapshot.lifetime_tokens : range_total;
     text(compact_tokens(display_total), {300, chart_top + 14, 398, chart_top + 46}, 20, strong,
          DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_FONT_WEIGHT_BOLD);
+
+    if (snapshot.session_tokens > 0) {
+        const auto badge_fill = mix(card, primary, live_pulse ? 0.18f + pulse * 0.10f : 0.12f);
+        rounded_rect({177, chart_top + 17, 293, chart_top + 43}, 13, badge_fill,
+                     color(primary.r, primary.g, primary.b, live_pulse ? 0.75f : 0.32f), 1.0f);
+        circle(190, chart_top + 30, live_pulse ? 3.2f + pulse * 1.1f : 2.6f, primary);
+        const std::wstring live_value = live_pulse
+            ? L"+" + compact_tokens(snapshot.live_token_delta)
+            : L"LIVE " + compact_tokens(snapshot.session_tokens);
+        text(live_value, {199, chart_top + 21, 285, chart_top + 40}, 9, primary,
+             DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    }
 
     const std::array<std::wstring, 3> ranges{L"24" + tr(settings, L"小时", L"h"), L"7" + tr(settings, L"天", L"d"), L"30" + tr(settings, L"天", L"d")};
     for (int i = 0; i < 3; ++i) {
@@ -462,11 +507,23 @@ void MainWindow::draw_home(const UsageSnapshot& snapshot, const Settings& settin
     const float gap = 3.2f;
     const float available = 360.0f;
     const float bar_width = std::max(3.0f, (available - gap * static_cast<float>(values.size() - 1)) / static_cast<float>(values.size()));
+    std::size_t latest_nonzero = values.size();
+    for (std::size_t i = values.size(); i > 0; --i) {
+        if (values[i - 1] > 0) {
+            latest_nonzero = i - 1;
+            break;
+        }
+    }
     for (std::size_t i = 0; i < values.size(); ++i) {
         const float ratio = static_cast<float>(values[i]) / static_cast<float>(maximum);
         const float height = values[i] == 0 ? 2.0f : std::max(4.0f, ratio * (graph_bottom - graph_top));
         const float x = 38.0f + i * (bar_width + gap);
         const auto bar_color = mix(primary, secondary, values.size() <= 1 ? 0.0f : static_cast<float>(i) / static_cast<float>(values.size() - 1) * 0.55f);
+        if (live_pulse && i == latest_nonzero) {
+            rounded_rect({x - 2.5f, graph_bottom - height - 4.0f, x + bar_width + 2.5f, graph_bottom + 2.0f},
+                         std::min(6.0f, bar_width / 2 + 2.0f),
+                         color(primary.r, primary.g, primary.b, 0.10f + pulse * 0.12f));
+        }
         rounded_rect({x, graph_bottom - height, x + bar_width, graph_bottom}, std::min(4.0f, bar_width / 2), bar_color);
     }
     line(38, graph_bottom + 1, 398, graph_bottom + 1, divider);

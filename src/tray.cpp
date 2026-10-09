@@ -27,6 +27,7 @@ constexpr UINT kMenuCapsule = 2003;
 constexpr UINT kMenuStartup = 2004;
 constexpr UINT kMenuExit = 2005;
 constexpr UINT_PTR kCapsuleRestoreTimer = 1;
+constexpr UINT_PTR kCapsuleLivePulseTimer = 2;
 constexpr UINT kCapsuleEnsureZOrder = WM_APP + 43;
 
 TrayIcon* g_tray_instance = nullptr;
@@ -72,6 +73,18 @@ COLORREF blend_color(COLORREF a, COLORREF b, int amount) {
 
 Gdiplus::Color gdiplus_color(COLORREF value, BYTE alpha = 255) {
     return Gdiplus::Color(alpha, GetRValue(value), GetGValue(value), GetBValue(value));
+}
+
+std::wstring compact_tokens(std::int64_t value) {
+    const double number = static_cast<double>(std::max<std::int64_t>(0, value));
+    wchar_t buffer[24]{};
+    if (number >= 1'000'000'000.0) swprintf_s(buffer, L"%.1fB", number / 1'000'000'000.0);
+    else if (number >= 1'000'000.0) swprintf_s(buffer, L"%.1fM", number / 1'000'000.0);
+    else if (number >= 1'000.0) swprintf_s(buffer, L"%.1fK", number / 1'000.0);
+    else swprintf_s(buffer, L"%lld", static_cast<long long>(number));
+    std::wstring result = buffer;
+    if (const auto position = result.find(L".0"); position != std::wstring::npos) result.erase(position, 2);
+    return result;
 }
 
 void add_rounded_rectangle(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rectangle, float radius) {
@@ -188,8 +201,13 @@ void TrayIcon::destroy() {
 }
 
 void TrayIcon::update(const UsageSnapshot& snapshot, const Settings& settings) {
+    const bool new_live_activity = snapshot.session_tokens > snapshot_.session_tokens ||
+                                   snapshot.live_token_updated_at > snapshot_.live_token_updated_at;
     snapshot_ = snapshot;
     settings_ = settings;
+    if (new_live_activity && snapshot_.live_token_delta > 0) {
+        live_pulse_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    }
     const QuotaWindow* quota = select_taskbar_quota(snapshot_, settings_.taskbar_metric);
     const int percentage = quota ? static_cast<int>(std::round(quota->remaining_percent)) : -1;
     const COLORREF icon_color = quota && snapshot_.health == AppHealth::Healthy
@@ -205,7 +223,10 @@ void TrayIcon::update(const UsageSnapshot& snapshot, const Settings& settings) {
         if (old) DestroyIcon(old);
     }
     reposition_capsule();
-    if (capsule_ && capsule_desired_visible_) paint_capsule();
+    if (capsule_ && capsule_desired_visible_) {
+        if (new_live_activity) SetTimer(capsule_, kCapsuleLivePulseTimer, 80, nullptr);
+        paint_capsule();
+    }
 }
 
 void TrayIcon::on_notify(LPARAM event) {
@@ -280,6 +301,9 @@ void TrayIcon::reposition_capsule() {
     // Per-pixel alpha supplies the smooth silhouette; a hard HRGN produces visible stair-stepping.
     SetWindowRgn(capsule_, nullptr, FALSE);
     show_capsule(true);
+    if (std::chrono::steady_clock::now() < live_pulse_until_) {
+        SetTimer(capsule_, kCapsuleLivePulseTimer, 80, nullptr);
+    }
     paint_capsule();
 }
 
@@ -324,6 +348,13 @@ LRESULT TrayIcon::handle_capsule_message(UINT message, WPARAM wparam, LPARAM lpa
         if (wparam == kCapsuleRestoreTimer) {
             KillTimer(capsule_, kCapsuleRestoreTimer);
             reposition_capsule();
+            return 0;
+        }
+        if (wparam == kCapsuleLivePulseTimer) {
+            if (std::chrono::steady_clock::now() >= live_pulse_until_) {
+                KillTimer(capsule_, kCapsuleLivePulseTimer);
+            }
+            paint_capsule();
             return 0;
         }
         return DefWindowProcW(capsule_, message, wparam, lparam);
@@ -420,8 +451,15 @@ void TrayIcon::paint_capsule() {
     const int percentage = quota ? static_cast<int>(std::round(quota->remaining_percent)) : -1;
     const COLORREF accent = quota && snapshot_.health == AppHealth::Healthy
         ? quota_color(quota->remaining_percent, settings_) : status_color(snapshot_, settings_);
+    const bool live_pulse = snapshot_.live_token_delta > 0 &&
+                            std::chrono::steady_clock::now() < live_pulse_until_;
+    const auto pulse_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const float pulse = live_pulse
+        ? 0.55f + 0.45f * static_cast<float>(std::sin(static_cast<double>(pulse_milliseconds) / 135.0))
+        : 0.0f;
     const COLORREF background = RGB(24, 30, 40);
-    const COLORREF border = blend_color(RGB(96, 106, 126), accent, 86);
+    const COLORREF border = blend_color(RGB(96, 106, 126), accent, live_pulse ? 150 : 86);
 
     {
         Gdiplus::Bitmap surface(width, height, width * 4, PixelFormat32bppPARGB,
@@ -439,9 +477,18 @@ void TrayIcon::paint_capsule() {
                                       static_cast<float>(height) - 3.0f);
         add_rounded_rectangle(body, body_rect, body_rect.Height / 2.0f);
         Gdiplus::SolidBrush body_brush(gdiplus_color(background, 252));
-        Gdiplus::Pen body_pen(gdiplus_color(border), 1.25f);
+        Gdiplus::Pen body_pen(gdiplus_color(border), 1.25f + (live_pulse ? pulse * 0.8f : 0.0f));
         graphics.FillPath(&body_brush, &body);
         graphics.DrawPath(&body_pen, &body);
+
+        if (live_pulse) {
+            Gdiplus::GraphicsPath glow;
+            const Gdiplus::RectF glow_rect(3.5f, 3.5f, static_cast<float>(width) - 7.0f,
+                                           static_cast<float>(height) - 7.0f);
+            add_rounded_rectangle(glow, glow_rect, glow_rect.Height / 2.0f);
+            Gdiplus::Pen glow_pen(gdiplus_color(accent, static_cast<BYTE>(60 + pulse * 70)), 1.2f);
+            graphics.DrawPath(&glow_pen, &glow);
+        }
 
         // Soft inner highlight separates the capsule from dark taskbars without a black halo.
         Gdiplus::GraphicsPath highlight;
@@ -455,14 +502,14 @@ void TrayIcon::paint_capsule() {
         const Gdiplus::RectF progress_rect(7.0f, (height - diameter) / 2.0f, diameter, diameter);
         Gdiplus::Pen track_pen(Gdiplus::Color(255, 56, 64, 78), 3.0f);
         graphics.DrawEllipse(&track_pen, progress_rect);
-        Gdiplus::Pen progress_pen(gdiplus_color(accent), 3.0f);
+        Gdiplus::Pen progress_pen(gdiplus_color(accent), 3.0f + (live_pulse ? pulse * 0.8f : 0.0f));
         progress_pen.SetStartCap(Gdiplus::LineCapRound);
         progress_pen.SetEndCap(Gdiplus::LineCapRound);
         if (percentage < 0) graphics.DrawEllipse(&progress_pen, progress_rect);
         else if (percentage > 0) graphics.DrawArc(&progress_pen, progress_rect, -90.0f,
                                                    std::min(359.9f, static_cast<float>(percentage) * 3.6f));
 
-        const float core = std::max(4.0f, diameter / 5.0f);
+        const float core = std::max(4.0f, diameter / 5.0f) + (live_pulse ? pulse * 2.5f : 0.0f);
         Gdiplus::SolidBrush core_brush(gdiplus_color(blend_color(background, accent, 112), 245));
         graphics.FillEllipse(&core_brush, progress_rect.X + (diameter - core) / 2.0f,
                              progress_rect.Y + (diameter - core) / 2.0f, core, core);
@@ -471,7 +518,9 @@ void TrayIcon::paint_capsule() {
         Gdiplus::Pen separator_pen(Gdiplus::Color(190, 54, 63, 78), 1.0f);
         graphics.DrawLine(&separator_pen, separator_x, 9.0f, separator_x, static_cast<float>(height) - 9.0f);
 
-        const std::wstring value = percentage >= 0 ? std::to_wstring(percentage) + L"%" : L"--";
+        const std::wstring value = live_pulse
+            ? L"+" + compact_tokens(snapshot_.live_token_delta)
+            : (percentage >= 0 ? std::to_wstring(percentage) + L"%" : L"--");
         Gdiplus::Font value_font(L"Segoe UI", std::max(10.0f, height * 0.34f),
                                  Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
         Gdiplus::Font label_font(L"Segoe UI", std::max(6.2f, height * 0.17f),
@@ -487,7 +536,8 @@ void TrayIcon::paint_capsule() {
         graphics.DrawString(value.c_str(), -1, &value_font, value_layout, &value_format, &value_brush);
         Gdiplus::RectF label_layout(separator_x + 5.0f, height * 0.53f,
                                     width - separator_x - 12.0f, height * 0.34f);
-        graphics.DrawString(L"CODEX", -1, &label_font, label_layout, &value_format, &label_brush);
+        graphics.DrawString(live_pulse ? L"TOKEN" : L"CODEX", -1, &label_font,
+                            label_layout, &value_format, &label_brush);
     }
 
     RECT window_rect{};
@@ -584,6 +634,10 @@ std::wstring TrayIcon::tooltip() const {
                 result += buffer;
             } else result += L"--";
         }
+    }
+    if (snapshot_.session_tokens > 0) {
+        result += english ? L"\nLive session " : L"\n本次实时 ";
+        result += compact_tokens(snapshot_.session_tokens) + L" tokens";
     }
     if (result.size() >= std::size(data_.szTip)) result.resize(std::size(data_.szTip) - 1);
     return result;

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace cqt {
 
@@ -13,7 +14,11 @@ class UsageHistory {
 public:
     explicit UsageHistory(std::filesystem::path codex_home = {});
 
-    void refresh(UsageSnapshot& snapshot);
+    // Returns only the tokens discovered during this incremental refresh.
+    [[nodiscard]] std::int64_t refresh(UsageSnapshot& snapshot);
+    // Fast path used by the directory watcher; only the changed JSONL files are touched.
+    [[nodiscard]] std::int64_t refresh_changed(
+        UsageSnapshot& snapshot, const std::vector<std::filesystem::path>& relative_paths);
     void cancel() { stop_requested_.store(true); }
     [[nodiscard]] const std::filesystem::path& codex_home() const { return codex_home_; }
 
@@ -25,8 +30,9 @@ private:
     };
 
     void discover_files();
-    void scan_file(FileState& state);
+    [[nodiscard]] std::int64_t scan_file(FileState& state);
     void prune();
+    void apply_to(UsageSnapshot& snapshot) const;
 
     std::filesystem::path codex_home_;
     std::map<std::wstring, FileState, std::less<>> files_;

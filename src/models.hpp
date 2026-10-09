@@ -55,6 +55,11 @@ struct UsageSnapshot {
     std::vector<TokenBucket> local_daily;
     std::int64_t lifetime_tokens = 0;
     std::int64_t peak_daily_tokens = 0;
+    // Runtime-only live activity. These fields are intentionally not persisted:
+    // a new process starts a fresh session counter and only pulses for new log data.
+    std::int64_t session_tokens = 0;
+    std::int64_t live_token_delta = 0;
+    std::int64_t live_token_updated_at = 0;
     AppHealth health = AppHealth::Starting;
     std::string status_detail;
     std::int64_t updated_at = 0;

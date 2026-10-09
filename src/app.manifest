@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="amd64" name="CodexQuotaTray" type="win32"/>
+  <assemblyIdentity version="1.1.0.0" processorArchitecture="amd64" name="CodexQuotaTray" type="win32"/>
   <description>Codex quota and token usage tray monitor</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
@@ -21,4 +21,3 @@
     </windowsSettings>
   </application>
 </assembly>
-

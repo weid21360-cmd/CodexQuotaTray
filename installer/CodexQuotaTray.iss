@@ -3,7 +3,7 @@
 #endif
 
 #define AppName "CodexQuotaTray"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define RepoRoot SourcePath + "..\"
 #define AppExe RepoRoot + "build\x64-release\" + Configuration + "\CodexQuotaTray.exe"
 

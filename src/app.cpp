@@ -10,13 +10,24 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cwchar>
+#include <cwctype>
+#include <vector>
 
 namespace cqt {
 namespace {
 
 std::string health_error(const RpcResult& result, std::string fallback) {
     return result.error.empty() ? std::move(fallback) : result.error;
+}
+
+bool is_history_log_change(std::wstring name) {
+    std::transform(name.begin(), name.end(), name.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(std::towlower(character));
+    });
+    if (!name.ends_with(L".jsonl")) return false;
+    return name.starts_with(L"sessions\\") || name.starts_with(L"archived_sessions\\");
 }
 
 } // namespace
@@ -54,7 +65,9 @@ bool AppController::initialize(bool background, std::wstring& error) {
     });
 
     stopping_.store(false);
+    history_stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     worker_ = std::thread(&AppController::worker_loop, this);
+    if (history_stop_event_) history_watcher_ = std::thread(&AppController::history_watch_loop, this);
     if (!background) window_->show();
     return true;
 }
@@ -70,10 +83,16 @@ int AppController::run() {
 
 void AppController::shutdown() {
     if (stopping_.exchange(true)) return;
+    if (history_stop_event_) SetEvent(history_stop_event_);
     worker_condition_.notify_all();
     history_.cancel();
     codex_.stop();
+    if (history_watcher_.joinable()) history_watcher_.join();
     if (worker_.joinable()) worker_.join();
+    if (history_stop_event_) {
+        CloseHandle(history_stop_event_);
+        history_stop_event_ = nullptr;
+    }
     if (tray_) tray_->destroy();
     tray_.reset();
     window_.reset();
@@ -128,7 +147,7 @@ void AppController::exit_application() {
 void AppController::on_snapshot_message() {
     const auto snapshot = snapshot_copy();
     const auto settings = settings_copy();
-    if (window_) window_->invalidate();
+    if (window_) window_->on_snapshot_updated(snapshot);
     if (tray_) tray_->update(snapshot, settings);
 }
 
@@ -234,6 +253,21 @@ void AppController::worker_loop() {
     auto next_usage = clock::now();
     auto retry_delay = std::chrono::seconds(2);
     UsageSnapshot working = snapshot_copy();
+    bool history_initialized = false;
+
+    auto refresh_local_history = [&](const std::vector<std::filesystem::path>* changed_paths = nullptr) {
+        const std::int64_t delta = changed_paths
+            ? history_.refresh_changed(working, *changed_paths)
+            : history_.refresh(working);
+        const bool first_refresh = !history_initialized;
+        history_initialized = true;
+        if (!first_refresh && delta > 0) {
+            working.session_tokens += delta;
+            working.live_token_delta = delta;
+            working.live_token_updated_at = unix_now();
+        }
+        return first_refresh || delta > 0;
+    };
 
     while (!stopping_.load()) {
         bool restart = false;
@@ -252,9 +286,26 @@ void AppController::worker_loop() {
                 working.status_detail = std::move(error);
                 publish_snapshot(working, false);
                 std::unique_lock wait_lock(worker_mutex_);
-                worker_condition_.wait_for(wait_lock, retry_delay, [&] { return stopping_.load() || restart_client_ || refresh_requested_; });
+                worker_condition_.wait_for(wait_lock, retry_delay, [&] {
+                    return stopping_.load() || restart_client_ || refresh_requested_ || history_requested_;
+                });
+                const bool refresh_history = history_requested_;
+                const bool full_history_refresh = history_full_refresh_requested_;
+                auto changed_paths = std::move(history_changed_paths_);
+                const bool stop_now = stopping_.load();
+                history_requested_ = false;
+                history_full_refresh_requested_ = false;
+                history_changed_paths_.clear();
                 refresh_requested_ = false;
                 usage_requested_ = false;
+                wait_lock.unlock();
+                if (stop_now) break;
+                if (refresh_history &&
+                    (full_history_refresh || changed_paths.empty()
+                         ? refresh_local_history()
+                         : refresh_local_history(&changed_paths))) {
+                    publish_snapshot(working, true);
+                }
                 retry_delay = std::min(retry_delay * 2, std::chrono::seconds(300));
                 continue;
             }
@@ -266,12 +317,21 @@ void AppController::worker_loop() {
 
         bool forced_quota = false;
         bool forced_usage = false;
+        bool forced_history = false;
+        bool full_history_refresh = false;
+        std::vector<std::filesystem::path> changed_paths;
         {
             std::lock_guard lock(worker_mutex_);
             forced_quota = refresh_requested_;
             forced_usage = usage_requested_;
+            forced_history = history_requested_;
+            full_history_refresh = history_full_refresh_requested_;
+            changed_paths = std::move(history_changed_paths_);
             refresh_requested_ = false;
             usage_requested_ = false;
+            history_requested_ = false;
+            history_full_refresh_requested_ = false;
+            history_changed_paths_.clear();
         }
 
         const auto now = clock::now();
@@ -281,21 +341,107 @@ void AppController::worker_loop() {
             changed = refresh_quota(working) || changed;
             next_quota = clock::now() + std::chrono::seconds(60);
         }
+        bool history_refreshed = false;
         if (forced_usage || now >= next_usage) {
             refresh_account(working);
             refresh_usage(working);
-            history_.refresh(working);
+            refresh_local_history();
+            history_refreshed = true;
             changed = true;
             persist = true;
             next_usage = clock::now() + std::chrono::minutes(5);
+        }
+        if (forced_history && !history_refreshed) {
+            const bool history_changed = full_history_refresh || changed_paths.empty()
+                ? refresh_local_history()
+                : refresh_local_history(&changed_paths);
+            changed = history_changed || changed;
+            persist = history_changed || persist;
         }
         if (changed) publish_snapshot(working, persist);
 
         const auto wake_at = std::min(next_quota, next_usage);
         std::unique_lock wait_lock(worker_mutex_);
         worker_condition_.wait_until(wait_lock, wake_at, [&] {
-            return stopping_.load() || refresh_requested_ || usage_requested_ || restart_client_;
+            return stopping_.load() || refresh_requested_ || usage_requested_ || history_requested_ || restart_client_;
         });
+    }
+}
+
+void AppController::history_watch_loop() {
+    if (!history_stop_event_ || history_.codex_home().empty()) return;
+    constexpr DWORD changes = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                              FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+    std::vector<std::byte> buffer(32 * 1024);
+
+    while (!stopping_.load()) {
+        HANDLE directory = CreateFileW(history_.codex_home().c_str(), FILE_LIST_DIRECTORY,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (directory == INVALID_HANDLE_VALUE) {
+            if (WaitForSingleObject(history_stop_event_, 30'000) == WAIT_OBJECT_0) return;
+            continue;
+        }
+        HANDLE change_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!change_event) {
+            CloseHandle(directory);
+            return;
+        }
+
+        while (!stopping_.load()) {
+            ResetEvent(change_event);
+            OVERLAPPED overlapped{};
+            overlapped.hEvent = change_event;
+            if (!ReadDirectoryChangesW(directory, buffer.data(), static_cast<DWORD>(buffer.size()), TRUE,
+                                       changes, nullptr, &overlapped, nullptr)) break;
+
+            const HANDLE events[]{change_event, history_stop_event_};
+            const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0 + 1) {
+                CancelIoEx(directory, &overlapped);
+                break;
+            }
+            if (wait != WAIT_OBJECT_0) break;
+
+            DWORD bytes = 0;
+            bool full_refresh = false;
+            std::vector<std::filesystem::path> changed_paths;
+            if (GetOverlappedResult(directory, &overlapped, &bytes, FALSE) && bytes > 0) {
+                std::size_t offset = 0;
+                while (offset + sizeof(FILE_NOTIFY_INFORMATION) <= bytes) {
+                    const auto* entry = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer.data() + offset);
+                    const std::wstring name(entry->FileName, entry->FileNameLength / sizeof(wchar_t));
+                    if (is_history_log_change(name)) changed_paths.emplace_back(name);
+                    if (entry->NextEntryOffset == 0) break;
+                    offset += entry->NextEntryOffset;
+                }
+            } else if (GetLastError() == ERROR_NOTIFY_ENUM_DIR) {
+                full_refresh = true;
+            }
+
+            if (full_refresh || !changed_paths.empty()) {
+                // Let a JSONL line finish writing and coalesce the usual size/write notification pair.
+                if (WaitForSingleObject(history_stop_event_, 220) == WAIT_OBJECT_0) break;
+                {
+                    std::lock_guard lock(worker_mutex_);
+                    history_requested_ = true;
+                    if (full_refresh) {
+                        history_full_refresh_requested_ = true;
+                        history_changed_paths_.clear();
+                    } else if (!history_full_refresh_requested_) {
+                        history_changed_paths_.insert(history_changed_paths_.end(),
+                                                      changed_paths.begin(), changed_paths.end());
+                    }
+                }
+                worker_condition_.notify_one();
+            }
+        }
+
+        CancelIoEx(directory, nullptr);
+        CloseHandle(change_event);
+        CloseHandle(directory);
+        if (!stopping_.load() && WaitForSingleObject(history_stop_event_, 2'000) == WAIT_OBJECT_0) return;
     }
 }
 

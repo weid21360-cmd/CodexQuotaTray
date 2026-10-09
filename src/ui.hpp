@@ -28,6 +28,7 @@ public:
     [[nodiscard]] bool visible() const;
     [[nodiscard]] HWND hwnd() const { return hwnd_; }
     void invalidate();
+    void on_snapshot_updated(const UsageSnapshot& snapshot);
     void apply_settings();
     void set_page(Page page);
     [[nodiscard]] Page page() const { return page_; }
