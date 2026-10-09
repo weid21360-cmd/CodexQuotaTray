@@ -89,7 +89,7 @@ json::Value initialize_params() {
     json::Value::Object client_info;
     client_info["name"] = "codex_quota_tray";
     client_info["title"] = "CodexQuotaTray";
-    client_info["version"] = "1.1.0";
+    client_info["version"] = "1.2.0";
 
     json::Value::Object capabilities;
     json::Value::Array opt_out;

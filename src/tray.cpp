@@ -28,7 +28,9 @@ constexpr UINT kMenuStartup = 2004;
 constexpr UINT kMenuExit = 2005;
 constexpr UINT_PTR kCapsuleRestoreTimer = 1;
 constexpr UINT_PTR kCapsuleLivePulseTimer = 2;
+constexpr UINT_PTR kTokenBurstAnimationTimer = 1;
 constexpr UINT kCapsuleEnsureZOrder = WM_APP + 43;
+constexpr auto kTokenBurstLifetime = std::chrono::milliseconds(1350);
 
 TrayIcon* g_tray_instance = nullptr;
 
@@ -85,6 +87,18 @@ std::wstring compact_tokens(std::int64_t value) {
     std::wstring result = buffer;
     if (const auto position = result.find(L".0"); position != std::wstring::npos) result.erase(position, 2);
     return result;
+}
+
+float ease_out_cubic(float value) {
+    const float inverse = 1.0f - std::clamp(value, 0.0f, 1.0f);
+    return 1.0f - inverse * inverse * inverse;
+}
+
+float ease_out_back(float value) {
+    constexpr float c1 = 1.70158f;
+    constexpr float c3 = c1 + 1.0f;
+    const float shifted = std::clamp(value, 0.0f, 1.0f) - 1.0f;
+    return 1.0f + c3 * shifted * shifted * shifted + c1 * shifted * shifted;
 }
 
 void add_rounded_rectangle(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rectangle, float radius) {
@@ -149,6 +163,25 @@ bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error
         gdiplus_token_ = 0;
         return false;
     }
+
+    WNDCLASSEXW burst_class{};
+    burst_class.cbSize = sizeof(burst_class);
+    burst_class.hInstance = controller_->instance();
+    burst_class.lpfnWndProc = token_burst_proc;
+    burst_class.lpszClassName = L"CodexQuotaTray.TokenBurst";
+    RegisterClassExW(&burst_class);
+    token_burst_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST |
+                                       WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                   burst_class.lpszClassName, L"Token activity", WS_POPUP,
+                                   0, 0, 190, 86, nullptr, nullptr, controller_->instance(), this);
+    if (!token_burst_) {
+        error = L"无法创建 Token 动态数字浮层。";
+        DestroyWindow(capsule_);
+        capsule_ = nullptr;
+        Gdiplus::GdiplusShutdown(gdiplus_token_);
+        gdiplus_token_ = 0;
+        return false;
+    }
     g_tray_instance = this;
     foreground_hook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                        foreground_event_proc, 0, 0,
@@ -190,6 +223,10 @@ void TrayIcon::destroy() {
         DestroyIcon(dynamic_icon_);
         dynamic_icon_ = nullptr;
     }
+    if (token_burst_) {
+        DestroyWindow(token_burst_);
+        token_burst_ = nullptr;
+    }
     if (capsule_) {
         DestroyWindow(capsule_);
         capsule_ = nullptr;
@@ -226,6 +263,9 @@ void TrayIcon::update(const UsageSnapshot& snapshot, const Settings& settings) {
     if (capsule_ && capsule_desired_visible_) {
         if (new_live_activity) SetTimer(capsule_, kCapsuleLivePulseTimer, 80, nullptr);
         paint_capsule();
+        if (new_live_activity && snapshot_.live_token_delta > 0) {
+            start_token_burst(snapshot_.live_token_delta);
+        }
     }
 }
 
@@ -263,6 +303,7 @@ void TrayIcon::reposition_capsule() {
     if (!should_show) {
         capsule_desired_visible_ = false;
         show_capsule(false);
+        hide_token_burst(true);
         return;
     }
 
@@ -284,6 +325,7 @@ void TrayIcon::reposition_capsule() {
     if (!should_show) {
         capsule_desired_visible_ = false;
         show_capsule(false);
+        hide_token_burst(true);
         return;
     }
     // Tie the top-level capsule to Explorer's taskbar. This keeps it out of Show Desktop/minimize
@@ -296,11 +338,16 @@ void TrayIcon::reposition_capsule() {
                       SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER)) {
         capsule_desired_visible_ = false;
         show_capsule(false);
+        hide_token_burst(true);
         return;
     }
     // Per-pixel alpha supplies the smooth silhouette; a hard HRGN produces visible stair-stepping.
     SetWindowRgn(capsule_, nullptr, FALSE);
     show_capsule(true);
+    if (token_burst_ && GetWindow(token_burst_, GW_OWNER) != taskbar) {
+        SetWindowLongPtrW(token_burst_, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(taskbar));
+    }
+    reposition_token_burst();
     if (std::chrono::steady_clock::now() < live_pulse_until_) {
         SetTimer(capsule_, kCapsuleLivePulseTimer, 80, nullptr);
     }
@@ -316,6 +363,18 @@ LRESULT CALLBACK TrayIcon::capsule_proc(HWND window, UINT message, WPARAM wparam
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
     return self ? self->handle_capsule_message(message, wparam, lparam) : DefWindowProcW(window, message, wparam, lparam);
+}
+
+LRESULT CALLBACK TrayIcon::token_burst_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    TrayIcon* self = reinterpret_cast<TrayIcon*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        self = static_cast<TrayIcon*>(create->lpCreateParams);
+        self->token_burst_ = window;
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    return self ? self->handle_token_burst_message(message, wparam, lparam)
+                : DefWindowProcW(window, message, wparam, lparam);
 }
 
 void CALLBACK TrayIcon::foreground_event_proc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
@@ -363,10 +422,45 @@ LRESULT TrayIcon::handle_capsule_message(UINT message, WPARAM wparam, LPARAM lpa
             SetWindowPos(capsule_, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
             paint_capsule();
+            if (token_burst_ && IsWindowVisible(token_burst_)) {
+                SetWindowPos(token_burst_, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                                 SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+            }
         }
         return 0;
     default:
         return DefWindowProcW(capsule_, message, wparam, lparam);
+    }
+}
+
+LRESULT TrayIcon::handle_token_burst_message(UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_PAINT:
+        paint_token_burst();
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_TIMER:
+        if (wparam == kTokenBurstAnimationTimer) {
+            const auto now = std::chrono::steady_clock::now();
+            std::erase_if(token_bursts_, [&](const TokenBurst& burst) {
+                return now - burst.started >= kTokenBurstLifetime;
+            });
+            if (token_bursts_.empty()) {
+                hide_token_burst(false);
+            } else {
+                paint_token_burst();
+            }
+            return 0;
+        }
+        return DefWindowProcW(token_burst_, message, wparam, lparam);
+    default:
+        return DefWindowProcW(token_burst_, message, wparam, lparam);
     }
 }
 
@@ -412,6 +506,171 @@ void TrayIcon::show_capsule(bool visible) {
     } else if (IsWindowVisible(capsule_)) {
         ShowWindow(capsule_, SW_HIDE);
     }
+}
+
+void TrayIcon::start_token_burst(std::int64_t tokens) {
+    if (!token_burst_ || !capsule_desired_visible_ || tokens <= 0) return;
+    static constexpr std::array<float, 6> offsets{-15.0f, 12.0f, -5.0f, 18.0f, -10.0f, 7.0f};
+    TokenBurst burst;
+    burst.tokens = tokens;
+    burst.started = std::chrono::steady_clock::now();
+    burst.horizontal_offset = offsets[token_burst_sequence_++ % offsets.size()];
+    token_bursts_.push_back(burst);
+    if (token_bursts_.size() > 4) token_bursts_.erase(token_bursts_.begin());
+    reposition_token_burst();
+    SetTimer(token_burst_, kTokenBurstAnimationTimer, 20, nullptr);
+    paint_token_burst();
+}
+
+void TrayIcon::reposition_token_burst() {
+    if (!token_burst_ || !capsule_) return;
+    if (!capsule_desired_visible_ || token_bursts_.empty()) {
+        if (IsWindowVisible(token_burst_)) ShowWindow(token_burst_, SW_HIDE);
+        return;
+    }
+
+    RECT capsule_rect{};
+    if (!GetWindowRect(capsule_, &capsule_rect)) return;
+    const float scale = static_cast<float>(settings_.taskbar_scale) *
+                        static_cast<float>(GetDpiForWindow(capsule_)) / 96.0f;
+    const int width = static_cast<int>(std::round(190.0f * scale));
+    const int height = static_cast<int>(std::round(86.0f * scale));
+    int x = capsule_rect.left + ((capsule_rect.right - capsule_rect.left) - width) / 2;
+    int y = capsule_rect.top - height - static_cast<int>(std::round(3.0f * scale));
+
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    const HMONITOR monitor = MonitorFromRect(&capsule_rect, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(monitor, &monitor_info)) {
+        x = std::clamp(x, monitor_info.rcMonitor.left + 2, monitor_info.rcMonitor.right - width - 2);
+        if (y < monitor_info.rcMonitor.top + 2) {
+            y = capsule_rect.bottom + static_cast<int>(std::round(3.0f * scale));
+        }
+    }
+    SetWindowPos(token_burst_, HWND_TOPMOST, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+}
+
+void TrayIcon::hide_token_burst(bool clear) {
+    if (!token_burst_) return;
+    KillTimer(token_burst_, kTokenBurstAnimationTimer);
+    if (clear) token_bursts_.clear();
+    if (IsWindowVisible(token_burst_)) ShowWindow(token_burst_, SW_HIDE);
+}
+
+void TrayIcon::paint_token_burst() {
+    if (!token_burst_ || !gdiplus_token_ || token_bursts_.empty()) return;
+    if (GetUpdateRect(token_burst_, nullptr, FALSE)) {
+        PAINTSTRUCT paint{};
+        BeginPaint(token_burst_, &paint);
+        EndPaint(token_burst_, &paint);
+    }
+
+    RECT client{};
+    GetClientRect(token_burst_, &client);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) return;
+
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!memory || !bitmap || !pixels) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
+    const auto now = std::chrono::steady_clock::now();
+    const COLORREF accent = palette_color(settings_);
+
+    {
+        Gdiplus::Bitmap surface(width, height, width * 4, PixelFormat32bppPARGB,
+                                static_cast<BYTE*>(pixels));
+        Gdiplus::Graphics graphics(&surface);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+        Gdiplus::FontFamily family(L"Segoe UI");
+        Gdiplus::StringFormat format;
+        format.SetAlignment(Gdiplus::StringAlignmentCenter);
+        format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+        for (std::size_t index = 0; index < token_bursts_.size(); ++index) {
+            const auto& burst = token_bursts_[index];
+            const float elapsed = static_cast<float>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - burst.started).count());
+            const float progress = std::clamp(elapsed / static_cast<float>(kTokenBurstLifetime.count()), 0.0f, 1.0f);
+            const float pop = ease_out_back(std::min(1.0f, progress / 0.28f));
+            const float scale = 0.38f + 0.62f * pop;
+            const float rise = height * 0.26f * ease_out_cubic(progress);
+            const float fade = progress < 0.58f ? 1.0f : std::max(0.0f, (1.0f - progress) / 0.42f);
+            const BYTE alpha = static_cast<BYTE>(std::round(255.0f * fade));
+            const float logical_scale = static_cast<float>(width) / 190.0f;
+            const float font_size = 27.0f * logical_scale * scale;
+            const float x_offset = burst.horizontal_offset * logical_scale;
+            const float top = height * 0.39f - rise + static_cast<float>(index) * 1.5f;
+            const std::wstring value = L"−" + compact_tokens(burst.tokens);
+
+            Gdiplus::GraphicsPath path;
+            const Gdiplus::RectF layout(x_offset, top, static_cast<float>(width), height * 0.48f);
+            path.AddString(value.c_str(), -1, &family, Gdiplus::FontStyleBold,
+                           font_size, layout, &format);
+
+            Gdiplus::Pen shadow(Gdiplus::Color(static_cast<BYTE>(alpha * 0.78f), 10, 13, 19),
+                                5.2f * logical_scale);
+            shadow.SetLineJoin(Gdiplus::LineJoinRound);
+            Gdiplus::Pen edge(gdiplus_color(accent, alpha), 2.1f * logical_scale);
+            edge.SetLineJoin(Gdiplus::LineJoinRound);
+            Gdiplus::SolidBrush face(Gdiplus::Color(alpha, 252, 253, 255));
+            graphics.DrawPath(&shadow, &path);
+            graphics.DrawPath(&edge, &path);
+            graphics.FillPath(&face, &path);
+
+            if (progress < 0.42f) {
+                const float spark_progress = progress / 0.42f;
+                const float spark_distance = (8.0f + 18.0f * ease_out_cubic(spark_progress)) * logical_scale;
+                const float center_x = width * 0.5f + x_offset;
+                const float center_y = top + height * 0.22f;
+                const BYTE spark_alpha = static_cast<BYTE>(alpha * (1.0f - spark_progress) * 0.72f);
+                Gdiplus::SolidBrush spark(gdiplus_color(accent, spark_alpha));
+                for (int ray = 0; ray < 5; ++ray) {
+                    const float angle = -2.75f + static_cast<float>(ray) * 0.61f;
+                    const float radius = (ray % 2 == 0 ? 2.0f : 1.4f) * logical_scale;
+                    const float px = center_x + std::cos(angle) * spark_distance;
+                    const float py = center_y + std::sin(angle) * spark_distance * 0.58f;
+                    graphics.FillEllipse(&spark, px - radius, py - radius, radius * 2.0f, radius * 2.0f);
+                }
+            }
+        }
+    }
+
+    RECT window_rect{};
+    GetWindowRect(token_burst_, &window_rect);
+    POINT destination{window_rect.left, window_rect.top};
+    POINT source{0, 0};
+    SIZE size{width, height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(token_burst_, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+
+    SelectObject(memory, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
 }
 
 void TrayIcon::paint_capsule() {

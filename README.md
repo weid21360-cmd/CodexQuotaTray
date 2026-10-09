@@ -9,6 +9,7 @@ A lightweight native Windows tray monitor for Codex quota and token activity. Th
 - Displays remaining percentage, reset countdown, reset time, account plan, and service health.
 - Provides 24-hour local Token activity plus 7-day and 30-day account activity with local fallback.
 - Reacts to new local `token_count` events in real time: the chart, session counter, and taskbar capsule pulse with the newly added Token count.
+- Pops elastic, game-style Token consumption numbers above the taskbar capsule, then lets them rise and fade without taking focus or intercepting clicks.
 - Includes a standard notification-area icon and an optional non-invasive taskbar capsule.
 - Supports Chinese, English, system/dark/light appearance, four palettes, custom colors, sizing controls, startup toggle, cached offline display, and manual Codex executable selection.
 - Does not read or persist authentication tokens. See [PRIVACY.md](PRIVACY.md).
