@@ -542,7 +542,8 @@ void TrayIcon::reposition_token_burst() {
     monitor_info.cbSize = sizeof(monitor_info);
     const HMONITOR monitor = MonitorFromRect(&capsule_rect, MONITOR_DEFAULTTONEAREST);
     if (GetMonitorInfoW(monitor, &monitor_info)) {
-        x = std::clamp(x, monitor_info.rcMonitor.left + 2, monitor_info.rcMonitor.right - width - 2);
+        x = std::clamp(x, static_cast<int>(monitor_info.rcMonitor.left) + 2,
+                       static_cast<int>(monitor_info.rcMonitor.right) - width - 2);
         if (y < monitor_info.rcMonitor.top + 2) {
             y = capsule_rect.bottom + static_cast<int>(std::round(3.0f * scale));
         }
