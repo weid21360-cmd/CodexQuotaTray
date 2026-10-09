@@ -28,9 +28,10 @@ constexpr UINT kMenuStartup = 2004;
 constexpr UINT kMenuExit = 2005;
 constexpr UINT_PTR kCapsuleRestoreTimer = 1;
 constexpr UINT_PTR kCapsuleLivePulseTimer = 2;
+constexpr UINT_PTR kTokenWindowSampleTimer = 3;
 constexpr UINT_PTR kTokenBurstAnimationTimer = 1;
 constexpr UINT kCapsuleEnsureZOrder = WM_APP + 43;
-constexpr auto kTokenBurstLifetime = std::chrono::milliseconds(1350);
+constexpr auto kTokenWindowDuration = std::chrono::seconds(3);
 
 TrayIcon* g_tray_instance = nullptr;
 
@@ -142,6 +143,7 @@ TrayIcon::~TrayIcon() {
 bool TrayIcon::create(AppController* controller, HWND owner, std::wstring& error) {
     controller_ = controller;
     owner_ = owner;
+    token_burst_random_state_ ^= static_cast<std::uint32_t>(GetTickCount64()) ^ GetCurrentProcessId();
     Gdiplus::GdiplusStartupInput gdiplus_input;
     if (Gdiplus::GdiplusStartup(&gdiplus_token_, &gdiplus_input, nullptr) != Gdiplus::Ok) {
         error = L"无法初始化任务栏图形引擎。";
@@ -264,7 +266,7 @@ void TrayIcon::update(const UsageSnapshot& snapshot, const Settings& settings) {
         if (new_live_activity) SetTimer(capsule_, kCapsuleLivePulseTimer, 80, nullptr);
         paint_capsule();
         if (new_live_activity && snapshot_.live_token_delta > 0) {
-            start_token_burst(snapshot_.live_token_delta);
+            record_token_sample(snapshot_.live_token_delta);
         }
     }
 }
@@ -416,6 +418,10 @@ LRESULT TrayIcon::handle_capsule_message(UINT message, WPARAM wparam, LPARAM lpa
             paint_capsule();
             return 0;
         }
+        if (wparam == kTokenWindowSampleTimer) {
+            emit_token_window();
+            return 0;
+        }
         return DefWindowProcW(capsule_, message, wparam, lparam);
     case kCapsuleEnsureZOrder:
         if (capsule_desired_visible_) {
@@ -449,7 +455,7 @@ LRESULT TrayIcon::handle_token_burst_message(UINT message, WPARAM wparam, LPARAM
         if (wparam == kTokenBurstAnimationTimer) {
             const auto now = std::chrono::steady_clock::now();
             std::erase_if(token_bursts_, [&](const TokenBurst& burst) {
-                return now - burst.started >= kTokenBurstLifetime;
+                return now - burst.started >= burst.lifetime;
             });
             if (token_bursts_.empty()) {
                 hide_token_burst(false);
@@ -508,13 +514,56 @@ void TrayIcon::show_capsule(bool visible) {
     }
 }
 
+void TrayIcon::record_token_sample(std::int64_t tokens) {
+    if (!capsule_ || !capsule_desired_visible_ || tokens <= 0) return;
+    token_samples_.push_back({tokens, std::chrono::steady_clock::now()});
+    if (!token_window_timer_running_ && SetTimer(capsule_, kTokenWindowSampleTimer, 1000, nullptr) != 0) {
+        token_window_timer_running_ = true;
+    }
+}
+
+void TrayIcon::emit_token_window() {
+    if (!capsule_ || !capsule_desired_visible_) {
+        hide_token_burst(true);
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(token_samples_, [&](const TokenSample& sample) {
+        return now - sample.recorded > kTokenWindowDuration;
+    });
+    std::int64_t tokens = 0;
+    for (const auto& sample : token_samples_) tokens += sample.tokens;
+    if (tokens > 0) start_token_burst(tokens);
+    if (token_samples_.empty()) {
+        KillTimer(capsule_, kTokenWindowSampleTimer);
+        token_window_timer_running_ = false;
+    }
+}
+
+float TrayIcon::next_burst_random() {
+    std::uint32_t value = token_burst_random_state_;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    token_burst_random_state_ = value == 0 ? 0x9e3779b9u : value;
+    return static_cast<float>(token_burst_random_state_ & 0x00ffffffu) /
+           static_cast<float>(0x01000000u);
+}
+
 void TrayIcon::start_token_burst(std::int64_t tokens) {
     if (!token_burst_ || !capsule_desired_visible_ || tokens <= 0) return;
-    static constexpr std::array<float, 6> offsets{-15.0f, 12.0f, -5.0f, 18.0f, -10.0f, 7.0f};
     TokenBurst burst;
     burst.tokens = tokens;
     burst.started = std::chrono::steady_clock::now();
-    burst.horizontal_offset = offsets[token_burst_sequence_++ % offsets.size()];
+    burst.horizontal_offset = (next_burst_random() * 2.0f - 1.0f) * 8.0f;
+    const float direction = next_burst_random() * 2.0f - 1.0f;
+    burst.drift_x = direction * (18.0f + next_burst_random() * 18.0f);
+    burst.drift_y = 18.0f + next_burst_random() * 20.0f;
+    burst.size_scale = 0.72f + next_burst_random() * 0.23f;
+    const double token_factor = std::clamp(std::log10(static_cast<double>(tokens) + 1.0) / 5.0, 0.0, 1.0);
+    const int lifetime_ms = static_cast<int>(std::round(1500.0 + token_factor * 350.0 +
+                                                        next_burst_random() * 150.0));
+    burst.lifetime = std::chrono::milliseconds(std::clamp(lifetime_ms, 1500, 2000));
     token_bursts_.push_back(burst);
     if (token_bursts_.size() > 4) token_bursts_.erase(token_bursts_.begin());
     reposition_token_burst();
@@ -555,7 +604,12 @@ void TrayIcon::reposition_token_burst() {
 void TrayIcon::hide_token_burst(bool clear) {
     if (!token_burst_) return;
     KillTimer(token_burst_, kTokenBurstAnimationTimer);
-    if (clear) token_bursts_.clear();
+    if (clear) {
+        token_bursts_.clear();
+        token_samples_.clear();
+        if (capsule_) KillTimer(capsule_, kTokenWindowSampleTimer);
+        token_window_timer_running_ = false;
+    }
     if (IsWindowVisible(token_burst_)) ShowWindow(token_burst_, SW_HIDE);
 }
 
@@ -615,16 +669,17 @@ void TrayIcon::paint_token_burst() {
             const auto& burst = token_bursts_[index];
             const float elapsed = static_cast<float>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - burst.started).count());
-            const float progress = std::clamp(elapsed / static_cast<float>(kTokenBurstLifetime.count()), 0.0f, 1.0f);
+            const float progress = std::clamp(elapsed / static_cast<float>(burst.lifetime.count()), 0.0f, 1.0f);
             const float pop = ease_out_back(std::min(1.0f, progress / 0.28f));
             const float scale = 0.38f + 0.62f * pop;
-            const float rise = height * 0.26f * ease_out_cubic(progress);
             const float fade = progress < 0.58f ? 1.0f : std::max(0.0f, (1.0f - progress) / 0.42f);
             const BYTE alpha = static_cast<BYTE>(std::round(255.0f * fade));
             const float logical_scale = static_cast<float>(width) / 190.0f;
-            const float font_size = 27.0f * logical_scale * scale;
-            const float x_offset = burst.horizontal_offset * logical_scale;
-            const float top = height * 0.39f - rise + static_cast<float>(index) * 1.5f;
+            const float travel = ease_out_cubic(progress);
+            const float font_size = 21.0f * logical_scale * burst.size_scale * scale;
+            const float x_offset = (burst.horizontal_offset + burst.drift_x * travel) * logical_scale;
+            const float rise = burst.drift_y * logical_scale * travel;
+            const float top = height * 0.50f - rise + static_cast<float>(index) * 1.5f;
             const std::wstring value = L"−" + compact_tokens(burst.tokens);
 
             Gdiplus::GraphicsPath path;

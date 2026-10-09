@@ -31,7 +31,16 @@ private:
     struct TokenBurst {
         std::int64_t tokens = 0;
         std::chrono::steady_clock::time_point started{};
+        std::chrono::milliseconds lifetime{1500};
         float horizontal_offset = 0.0f;
+        float drift_x = 0.0f;
+        float drift_y = 0.0f;
+        float size_scale = 1.0f;
+    };
+
+    struct TokenSample {
+        std::int64_t tokens = 0;
+        std::chrono::steady_clock::time_point recorded{};
     };
 
     static LRESULT CALLBACK capsule_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
@@ -45,10 +54,13 @@ private:
     void show_menu();
     void show_capsule(bool visible);
     void paint_capsule();
+    void record_token_sample(std::int64_t tokens);
+    void emit_token_window();
     void start_token_burst(std::int64_t tokens);
     void reposition_token_burst();
     void hide_token_burst(bool clear);
     void paint_token_burst();
+    [[nodiscard]] float next_burst_random();
     [[nodiscard]] HICON create_percentage_icon(int percentage, COLORREF color) const;
     [[nodiscard]] std::wstring tooltip() const;
 
@@ -64,8 +76,10 @@ private:
     Settings settings_;
     bool capsule_desired_visible_ = false;
     std::chrono::steady_clock::time_point live_pulse_until_{};
+    bool token_window_timer_running_ = false;
+    std::vector<TokenSample> token_samples_;
     std::vector<TokenBurst> token_bursts_;
-    std::uint64_t token_burst_sequence_ = 0;
+    std::uint32_t token_burst_random_state_ = 0x9e3779b9u;
 };
 
 } // namespace cqt
