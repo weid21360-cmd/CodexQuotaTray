@@ -91,16 +91,28 @@ bool is_token_count_event(const json::Value& line) {
 std::int64_t cumulative_total(const json::Value& line) {
     const auto* total_usage = find_recursive_key(line, "total_token_usage");
     if (!total_usage || !total_usage->is_object()) return -1;
-    if (const auto* total = total_usage->find("total_tokens"); total && total->is_number()) return total->as_int64(-1);
-    std::int64_t sum = 0;
-    bool found = false;
-    for (const auto key : {"input_tokens", "output_tokens"}) {
-        if (const auto* value = total_usage->find(key); value && value->is_number()) {
-            sum += std::max<std::int64_t>(0, value->as_int64());
-            found = true;
+
+    // Codex reports cached prompt tokens inside input_tokens. They are useful for
+    // billing/cache diagnostics, but counting them again makes a tiny turn look
+    // like a 100K+ Token burst. Use the cumulative non-cached input plus output so
+    // subtracting consecutive samples yields the work newly consumed by the turn.
+    const auto* input = total_usage->find("input_tokens");
+    const auto* output = total_usage->find("output_tokens");
+    if (input && input->is_number() && output && output->is_number()) {
+        const std::int64_t input_tokens = std::max<std::int64_t>(0, input->as_int64());
+        const std::int64_t output_tokens = std::max<std::int64_t>(0, output->as_int64());
+        std::int64_t cached_input_tokens = 0;
+        if (const auto* cached = total_usage->find("cached_input_tokens"); cached && cached->is_number()) {
+            cached_input_tokens = std::max<std::int64_t>(0, cached->as_int64());
         }
+        return std::max<std::int64_t>(0, input_tokens - cached_input_tokens) + output_tokens;
     }
-    return found ? sum : -1;
+
+    // Older Codex builds only expose total_tokens.
+    if (const auto* total = total_usage->find("total_tokens"); total && total->is_number()) {
+        return total->as_int64(-1);
+    }
+    return -1;
 }
 
 } // namespace
@@ -181,8 +193,54 @@ std::int64_t UsageHistory::refresh_changed(
     return discovered_tokens;
 }
 
+std::int64_t UsageHistory::refresh_live_threads(UsageSnapshot& snapshot) {
+    if (stop_requested_.load()) return 0;
+    const auto thread_ids = writer_thread_ids();
+    if (thread_ids.empty()) return 0;
+
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    std::int64_t discovered_tokens = 0;
+    for (auto& [key, state] : files_) {
+        if (stop_requested_.load()) break;
+        const bool has_writer = std::any_of(thread_ids.begin(), thread_ids.end(), [&](const std::wstring& id) {
+            return key.find(id) != std::wstring::npos;
+        });
+        if (has_writer) discovered_tokens += scan_file(state);
+    }
+    if (discovered_tokens > 0) {
+        prune();
+        apply_to(snapshot);
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    return discovered_tokens;
+}
+
+std::vector<std::wstring> UsageHistory::writer_thread_ids() const {
+    std::vector<std::wstring> ids;
+    const auto root = codex_home_ / L"thread-writer-locks";
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(root, std::filesystem::directory_options::skip_permission_denied, error);
+    const std::filesystem::directory_iterator end;
+    while (iterator != end) {
+        if (error) {
+            error.clear();
+            iterator.increment(error);
+            continue;
+        }
+        const auto& entry = *iterator;
+        if (entry.is_regular_file(error) && entry.path().extension() == L".lock") {
+            const std::wstring id = entry.path().stem().wstring();
+            if (!id.empty() && id.front() != L'.') ids.push_back(id);
+        }
+        error.clear();
+        iterator.increment(error);
+    }
+    return ids;
+}
+
 void UsageHistory::discover_files() {
     const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 31);
+    const auto thread_ids = writer_thread_ids();
     for (const auto& root : {codex_home_ / L"sessions", codex_home_ / L"archived_sessions"}) {
         std::error_code error;
         if (!std::filesystem::exists(root, error)) continue;
@@ -197,11 +255,14 @@ void UsageHistory::discover_files() {
             }
             const auto& entry = *iterator;
             if (entry.is_regular_file(error) && entry.path().extension() == L".jsonl") {
+                const std::wstring key = entry.path().filename().wstring();
                 const auto modified = entry.last_write_time(error);
-                if (!error && modified >= cutoff) {
+                const bool has_writer = std::any_of(thread_ids.begin(), thread_ids.end(), [&](const std::wstring& id) {
+                    return key.find(id) != std::wstring::npos;
+                });
+                if (!error && (modified >= cutoff || has_writer)) {
                     // Session filenames are UUIDs; retaining the key across a move to
                     // archived_sessions avoids rescanning and double-counting the file.
-                    const std::wstring key = entry.path().filename().wstring();
                     auto [position, inserted] = files_.try_emplace(key);
                     if (inserted) position->second.path = entry.path();
                     else if (position->second.path != entry.path()) {

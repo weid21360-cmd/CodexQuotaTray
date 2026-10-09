@@ -19,6 +19,9 @@ public:
     // Fast path used by the directory watcher; only the changed JSONL files are touched.
     [[nodiscard]] std::int64_t refresh_changed(
         UsageSnapshot& snapshot, const std::vector<std::filesystem::path>& relative_paths);
+    // One-second safety net for Codex writers that append through handles which do
+    // not reliably update LastWriteTime or trigger ReadDirectoryChangesW.
+    [[nodiscard]] std::int64_t refresh_live_threads(UsageSnapshot& snapshot);
     void cancel() { stop_requested_.store(true); }
     [[nodiscard]] const std::filesystem::path& codex_home() const { return codex_home_; }
 
@@ -30,6 +33,7 @@ private:
     };
 
     void discover_files();
+    [[nodiscard]] std::vector<std::wstring> writer_thread_ids() const;
     [[nodiscard]] std::int64_t scan_file(FileState& state);
     void prune();
     void apply_to(UsageSnapshot& snapshot) const;

@@ -251,6 +251,7 @@ void AppController::worker_loop() {
     using clock = std::chrono::steady_clock;
     auto next_quota = clock::now();
     auto next_usage = clock::now();
+    auto next_live_probe = clock::now();
     auto retry_delay = std::chrono::seconds(2);
     UsageSnapshot working = snapshot_copy();
     bool history_initialized = false;
@@ -267,6 +268,16 @@ void AppController::worker_loop() {
             working.live_token_updated_at = unix_now();
         }
         return first_refresh || delta > 0;
+    };
+
+    auto refresh_live_history = [&] {
+        if (!history_initialized) return refresh_local_history();
+        const std::int64_t delta = history_.refresh_live_threads(working);
+        if (delta <= 0) return false;
+        working.session_tokens += delta;
+        working.live_token_delta = delta;
+        working.live_token_updated_at = unix_now();
+        return true;
     };
 
     while (!stopping_.load()) {
@@ -288,27 +299,39 @@ void AppController::worker_loop() {
                 // token_count write can still be handled as a true live increment.
                 const bool initialized_history = !history_initialized && refresh_local_history();
                 publish_snapshot(working, initialized_history);
-                std::unique_lock wait_lock(worker_mutex_);
-                worker_condition_.wait_for(wait_lock, retry_delay, [&] {
-                    return stopping_.load() || restart_client_ || refresh_requested_ || history_requested_;
-                });
-                const bool refresh_history = history_requested_;
-                const bool full_history_refresh = history_full_refresh_requested_;
-                auto changed_paths = std::move(history_changed_paths_);
-                const bool stop_now = stopping_.load();
-                history_requested_ = false;
-                history_full_refresh_requested_ = false;
-                history_changed_paths_.clear();
-                refresh_requested_ = false;
-                usage_requested_ = false;
-                wait_lock.unlock();
-                if (stop_now) break;
-                if (refresh_history &&
-                    (full_history_refresh || changed_paths.empty()
-                         ? refresh_local_history()
-                         : refresh_local_history(&changed_paths))) {
-                    publish_snapshot(working, true);
+                next_live_probe = clock::now() + std::chrono::seconds(1);
+                const auto retry_at = clock::now() + retry_delay;
+                bool retry_now = false;
+                while (!stopping_.load() && !retry_now && clock::now() < retry_at) {
+                    const auto wake_at = std::min(retry_at, next_live_probe);
+                    std::unique_lock wait_lock(worker_mutex_);
+                    worker_condition_.wait_until(wait_lock, wake_at, [&] {
+                        return stopping_.load() || restart_client_ || refresh_requested_ || history_requested_;
+                    });
+                    retry_now = restart_client_ || refresh_requested_;
+                    const bool refresh_history = history_requested_;
+                    const bool full_history_refresh = history_full_refresh_requested_;
+                    auto changed_paths = std::move(history_changed_paths_);
+                    history_requested_ = false;
+                    history_full_refresh_requested_ = false;
+                    history_changed_paths_.clear();
+                    refresh_requested_ = false;
+                    usage_requested_ = false;
+                    wait_lock.unlock();
+
+                    bool history_changed = false;
+                    if (refresh_history) {
+                        history_changed = full_history_refresh || changed_paths.empty()
+                            ? refresh_local_history()
+                            : refresh_local_history(&changed_paths);
+                    }
+                    if (clock::now() >= next_live_probe) {
+                        history_changed = refresh_live_history() || history_changed;
+                        next_live_probe = clock::now() + std::chrono::seconds(1);
+                    }
+                    if (history_changed) publish_snapshot(working, true);
                 }
+                if (stopping_.load()) break;
                 retry_delay = std::min(retry_delay * 2, std::chrono::seconds(300));
                 continue;
             }
@@ -316,6 +339,7 @@ void AppController::worker_loop() {
             refresh_account(working);
             next_quota = clock::now();
             next_usage = clock::now();
+            next_live_probe = clock::now();
         }
 
         bool forced_quota = false;
@@ -361,9 +385,17 @@ void AppController::worker_loop() {
             changed = history_changed || changed;
             persist = history_changed || persist;
         }
+        if (!history_refreshed && now >= next_live_probe) {
+            const bool live_changed = refresh_live_history();
+            changed = live_changed || changed;
+            persist = live_changed || persist;
+            next_live_probe = clock::now() + std::chrono::seconds(1);
+        } else if (history_refreshed) {
+            next_live_probe = clock::now() + std::chrono::seconds(1);
+        }
         if (changed) publish_snapshot(working, persist);
 
-        const auto wake_at = std::min(next_quota, next_usage);
+        const auto wake_at = std::min({next_quota, next_usage, next_live_probe});
         std::unique_lock wait_lock(worker_mutex_);
         worker_condition_.wait_until(wait_lock, wake_at, [&] {
             return stopping_.load() || refresh_requested_ || usage_requested_ || history_requested_ || restart_client_;

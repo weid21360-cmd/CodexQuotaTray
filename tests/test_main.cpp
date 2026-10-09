@@ -100,8 +100,14 @@ void test_incremental_history() {
     const auto unique = std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
     const auto root = std::filesystem::temp_directory_path() / ("cqt-history-" + unique);
     const auto sessions = root / "sessions";
+    const auto locks = root / "thread-writer-locks";
     std::filesystem::create_directories(sessions);
-    const auto log = sessions / "session.jsonl";
+    std::filesystem::create_directories(locks);
+    const std::string thread_id = "01a11aa2-9380-7b00-8998-44588795ca47";
+    const auto log = sessions / ("rollout-test-" + thread_id + ".jsonl");
+    {
+        std::ofstream lock(locks / (thread_id + ".lock"), std::ios::binary);
+    }
 
     const std::time_t now = std::time(nullptr);
     std::tm utc{};
@@ -109,29 +115,46 @@ void test_incremental_history() {
     char timestamp[32]{};
     std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
     const std::string prefix = std::string("{\"timestamp\":\"") + timestamp +
-        "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":";
-    const std::string first = prefix + "100}}}}";
-    const std::string second = prefix + "160}}}}";
+        "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":";
+    const std::string first = prefix +
+        "{\"input_tokens\":1000,\"cached_input_tokens\":900,\"output_tokens\":100,\"total_tokens\":1100}}}}";
+    const std::string second = prefix +
+        "{\"input_tokens\":1600,\"cached_input_tokens\":1400,\"output_tokens\":160,\"total_tokens\":1760}}}}";
     const std::size_t split = second.size() / 2;
     {
         std::ofstream stream(log, std::ios::binary);
         stream << first << '\n' << second.substr(0, split);
     }
+    // Reproduce Codex writers whose contents grow while LastWriteTime remains stale.
+    std::filesystem::last_write_time(
+        log, std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 60));
 
     cqt::UsageHistory history(root);
     cqt::UsageSnapshot snapshot;
-    CHECK(history.refresh(snapshot) == 100);
+    CHECK(history.refresh(snapshot) == 200);
     auto total = std::accumulate(snapshot.local_hourly.begin(), snapshot.local_hourly.end(), std::int64_t{},
                                  [](std::int64_t sum, const cqt::TokenBucket& bucket) { return sum + bucket.tokens; });
-    CHECK(total == 100);
+    CHECK(total == 200);
     {
         std::ofstream stream(log, std::ios::binary | std::ios::app);
         stream << second.substr(split) << '\n';
     }
-    CHECK(history.refresh_changed(snapshot, {std::filesystem::path("sessions") / "session.jsonl"}) == 60);
+    // The safety-net path must find appended data from the writer lock even when
+    // no filesystem notification is delivered.
+    CHECK(history.refresh_live_threads(snapshot) == 160);
     total = std::accumulate(snapshot.local_hourly.begin(), snapshot.local_hourly.end(), std::int64_t{},
                             [](std::int64_t sum, const cqt::TokenBucket& bucket) { return sum + bucket.tokens; });
-    CHECK(total == 160);
+    CHECK(total == 360);
+
+    const auto legacy_log = sessions / "legacy.jsonl";
+    {
+        std::ofstream stream(legacy_log, std::ios::binary);
+        stream << prefix << "{\"total_tokens\":40}}}}" << '\n';
+    }
+    CHECK(history.refresh_changed(snapshot, {std::filesystem::path("sessions") / "legacy.jsonl"}) == 40);
+    total = std::accumulate(snapshot.local_hourly.begin(), snapshot.local_hourly.end(), std::int64_t{},
+                            [](std::int64_t sum, const cqt::TokenBucket& bucket) { return sum + bucket.tokens; });
+    CHECK(total == 400);
     std::error_code error;
     std::filesystem::remove_all(root, error);
 }
